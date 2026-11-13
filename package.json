@@ -1,0 +1,19 @@
+{
+  "name": "citamo-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp HD video downloader bot (.c <url>)",
+  "type": "module",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node --watch-path=index.js --watch-path=downloader.js --watch-path=sticker.js index.js",
+    "test:dl": "node test-downloader.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "node-webpmux": "^3.2.1",
+    "pino": "^10.4.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
