@@ -1,4 +1,4 @@
-// index.js — Baileys socket + .c / .cs / .csc / .cdl / .help (.menu) router (see .agents/skills/whatsapp-baileys-architect)
+// index.js — Baileys socket + .c / .cs / .csc / .cdl / .chelp (.menu) router (see .agents/skills/whatsapp-baileys-architect)
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -22,7 +22,7 @@ const MAX_STICKER_BYTES = 15 * 1024 * 1024;
 const MAX_CONCURRENT_JOBS = 2;
 const RECONNECT_DELAY_MS = 3000;
 const MENU_TTL_MS = 120_000; // 2-minute TTL for .cdl interactive selection menus
-const HELP_COOLDOWN_MS = 10_000; // 10-second per-chat cooldown for .help / .menu
+const HELP_COOLDOWN_MS = 10_000; // 10-second per-chat cooldown for .chelp / .menu
 const MAX_SENT_IDS = 200;
 const STICKER_USAGE =
   'Usage: Reply to an image/GIF with .csc, send an image with caption .csc, or send .csc <image-url> (add "crop" for square crop).';
@@ -75,7 +75,7 @@ function rememberSentId(id) {
   }
 }
 
-// Per-chat cooldown store for .help / .menu keyed by `remoteJid`
+// Per-chat cooldown store for .chelp / .menu keyed by `remoteJid`
 const helpCooldowns = new Map();
 
 // Pending .cdl interactive menus keyed by `${remoteJid}_${senderJid}`
@@ -197,7 +197,7 @@ async function startSock() {
     }
     if (connection === "open") {
       activeSock = sock;
-      console.log("✅ Connected to WhatsApp. Listening for .c, .cs, .csc, .cdl, and .help");
+      console.log("✅ Connected to WhatsApp. Listening for .c, .cs, .csc, .cdl, and .chelp");
     }
     if (connection === "close") {
       sock.ev.removeAllListeners();
@@ -274,8 +274,8 @@ async function startSock() {
         continue;
       }
 
-      // 2. Check for .help or .menu command (with 10s per-chat cooldown)
-      if (choice === ".help" || choice === ".menu") {
+      // 2. Check for .chelp or .menu command (with 10s per-chat cooldown)
+      if (choice === ".chelp" || choice === ".menu") {
         const now = Date.now();
         const lastHelpAt = helpCooldowns.get(remoteJid) || 0;
         if (now - lastHelpAt < HELP_COOLDOWN_MS) continue;
@@ -283,7 +283,7 @@ async function startSock() {
         setTimeout(() => helpCooldowns.delete(remoteJid), HELP_COOLDOWN_MS).unref?.();
 
         sendSafe(remoteJid, { text: HELP_TEXT }, { quoted: msg }).catch((e) =>
-          console.error(".help handler error:", e),
+          console.error(".chelp handler error:", e),
         );
         continue;
       }
