@@ -24,35 +24,26 @@ const RECONNECT_DELAY_MS = 3000;
 const MENU_TTL_MS = 120_000; // 2-minute TTL for .cdl interactive selection menus
 const HELP_COOLDOWN_MS = 10_000; // 10-second per-chat cooldown for .chelp / .menu
 const MAX_SENT_IDS = 200;
+const C_USAGE = "Usage: Send .c <url> to download an HD video.";
+const CS_USAGE =
+  "Usage: Send .cs <url> to download a Status HD video (auto-splits >60s).";
 const STICKER_USAGE =
   'Usage: Reply to an image/GIF with .csc, send an image with caption .csc, or send .csc <image-url> (add "crop" for square crop).';
 const CDL_USAGE =
   "Usage: Send .cdl <url> (for interactive MP4/MP3 menu) or .cdl mp4 <url> / .cdl mp3 <url>.";
-const HELP_TEXT = `🤖 *CITAMO BOT — COMMAND GUIDE*
+const HELP_TEXT = `🤖 *CITAMO BOT — COMMANDS*
 
-🎬 *1. HD Video Downloader*
-• \`.c <url>\`
-  Download original HD video (auto-sends as document if > 50MB).
+🎬 *Video & Audio*
+• \`.c <url>\` — Download HD video
+• \`.cs <url>\` — Status HD video (auto-splits >60s)
+• \`.cdl <url>\` — Choose MP4 or MP3 menu
+• \`.cdl mp4/mp3 <url>\` — Direct MP4 or MP3
 
-📱 *2. WhatsApp Status HD Optimizer*
-• \`.cs <url>\`
-  Optimizes bitrate & resolution for WhatsApp Status without losing original FPS. Auto-splits videos over 60s into parts.
+🖼️ *Stickers* _(reply, caption, or URL)_
+• \`.csc [url]\` — Full-frame sticker
+• \`.csc crop [url]\` — Square-cropped sticker
 
-🔀 *3. Multi-Platform MP4 / MP3 Downloader*
-• \`.cdl <url>\`
-  Interactive menu — reply *1* (\`mp4\`) for video or *2* (\`mp3\`) for audio.
-• \`.cdl mp4 <url>\` — Direct HD video download
-• \`.cdl mp3 <url>\` — Direct high-quality MP3 audio
-
-🖼️ *4. Sticker Maker (Image / GIF / Video)*
-• \`.csc\` _(reply to an image, GIF, or sticker, or send as caption)_
-  Creates a full-frame 512×512 sticker with transparent padding.
-• \`.csc crop\` _(reply or caption)_
-  Center-crops media into a full square sticker.
-• \`.csc <image/gif-url>\`
-  Converts a direct image or GIF link into a sticker (supports \`.csc crop <url>\`).
-
-💡 *Supported Platforms:* YouTube, TikTok, Instagram, Facebook, X (Twitter), Reddit, SoundCloud & 1,000+ sites.`;
+💡 *Supports:* YouTube, TikTok, IG, FB, X, Reddit, SoundCloud & more.`;
 
 const logger = pino({ level: "silent" });
 
@@ -293,11 +284,17 @@ async function startSock() {
 
       if (cmd === ".c") {
         const url = tokens[1];
-        if (!url || !/^https?:\/\//i.test(url)) continue;
+        if (!url || !/^https?:\/\//i.test(url)) {
+          sendSafe(remoteJid, { text: C_USAGE }, { quoted: msg }).catch(() => {});
+          continue;
+        }
         handleCdlDownload(msg, "mp4", url).catch((e) => console.error("Handler error:", e));
       } else if (cmd === ".cs") {
         const url = tokens[1];
-        if (!url || !/^https?:\/\//i.test(url)) continue;
+        if (!url || !/^https?:\/\//i.test(url)) {
+          sendSafe(remoteJid, { text: CS_USAGE }, { quoted: msg }).catch(() => {});
+          continue;
+        }
         handleStatusCommand(msg, url).catch((e) => console.error("Handler error:", e));
       } else if (cmd === ".csc") {
         const args = tokens.slice(1);
