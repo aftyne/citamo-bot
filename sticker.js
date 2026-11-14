@@ -85,6 +85,7 @@ export async function fetchImageFromUrl(url, jobDir) {
     parsed = await assertSafePublicUrl(currentUrl);
     res = await fetch(currentUrl, {
       redirect: 'manual',
+      referrerPolicy: 'no-referrer',
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       headers: {
         'User-Agent':

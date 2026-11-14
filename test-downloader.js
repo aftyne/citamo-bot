@@ -5,6 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import webp from 'node-webpmux';
 import {
+  assertSafeContentMetadata,
   assertSafePublicUrl,
   downloadVideo,
   downloadAndOptimizeForStatus,
@@ -445,6 +446,103 @@ console.log('\n=== Test 6: SSRF blocking, safe redirects, & fetchImageFromUrl li
     await new Promise((resolve) => server.close(resolve));
     await fs.promises.rm(srvDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: Multi-Layer NSFW Blocker, IP-Grabber Defense & Domain Allowlist
+// ---------------------------------------------------------------------------
+console.log('\n=== Test 7: NSFW blocker, IP-grabber defense, raw-IP block & domain allowlist ===');
+{
+  // 7a: Zero-latency NSFW domains, TLDs, and paths (< 5ms, no yt-dlp spawned)
+  const nsfwUrls = [
+    'https://www.pornhub.com/view_video.php?viewkey=123',
+    'https://nhentai.net/g/12345/',
+    'https://example.xxx/video.mp4',
+    'https://sub.xvideos.com/video123',
+    'https://www.reddit.com/r/nsfw/comments/123/post/',
+  ];
+
+  const t0 = performance.now();
+  for (const nsfwUrl of nsfwUrls) {
+    let blocked = false;
+    try {
+      await assertSafePublicUrl(nsfwUrl);
+    } catch (err) {
+      blocked = /NSFW or age-restricted/i.test(err.message);
+    }
+    if (!blocked) {
+      fail(`Test 7a expected NSFW block for ${nsfwUrl}`);
+    }
+  }
+  const elapsedMs = performance.now() - t0;
+  console.log(`[Test 7a] Blocked all ${nsfwUrls.length} NSFW URLs in ${elapsedMs.toFixed(2)}ms`);
+  if (elapsedMs > 50) {
+    fail(`Test 7a expected zero-latency pre-DNS NSFW block, took ${elapsedMs.toFixed(2)}ms`);
+  }
+
+  // 7b: IP grabbers, canary webhooks, arbitrary untrusted domains, and raw public IPs
+  const grabberUrls = [
+    'https://grabify.link/ABC123',
+    'https://iplogger.org/12345',
+    'https://sub.webhook.site/token',
+    'https://abc.ngrok-free.app/clip.mp4',
+  ];
+  for (const gUrl of grabberUrls) {
+    let blocked = false;
+    try {
+      await assertSafePublicUrl(gUrl);
+    } catch (err) {
+      blocked = /IP grabber|untrusted tracking/i.test(err.message);
+    }
+    if (!blocked) {
+      fail(`Test 7b expected IP grabber block for ${gUrl}`);
+    }
+  }
+
+  let untrustedBlocked = false;
+  try {
+    await assertSafePublicUrl('https://my-evil-ip-logger.com/video.mp4');
+  } catch (err) {
+    untrustedBlocked = /Unsupported or untrusted domain/i.test(err.message);
+  }
+  if (!untrustedBlocked) {
+    fail('Test 7b expected unknown domain to be rejected by allowlist before DNS lookup');
+  }
+
+  let rawIpBlocked = false;
+  try {
+    await assertSafePublicUrl('http://93.184.216.34/image.png');
+  } catch (err) {
+    rawIpBlocked = /Raw IP URLs are blocked/i.test(err.message);
+  }
+  if (!rawIpBlocked) {
+    fail('Test 7b expected raw public IP literal URL to be blocked');
+  }
+  console.log('[Test 7b] IP grabbers, unknown domains, and raw public IPs blocked pre-DNS');
+
+  // 7c: Metadata title & age_limit filter
+  let titleBlocked = false;
+  let ageBlocked = false;
+  try {
+    assertSafeContentMetadata('Leaked 18+ NSFW video', 0);
+  } catch (err) {
+    titleBlocked = /NSFW or age-restricted/i.test(err.message);
+  }
+  try {
+    assertSafeContentMetadata('Normal Gaming Clip', 18);
+  } catch (err) {
+    ageBlocked = /NSFW or age-restricted/i.test(err.message);
+  }
+  if (!titleBlocked || !ageBlocked) {
+    fail('Test 7c expected assertSafeContentMetadata to block 18+ title and age_limit >= 18');
+  }
+
+  // 7d: Allowed public platforms pass validation
+  const allowedCheck = await assertSafePublicUrl('https://www.youtube.com/watch?v=jNQXAC9IVRw');
+  if (allowedCheck.hostname !== 'www.youtube.com') {
+    fail('Test 7d expected youtube.com to pass assertSafePublicUrl');
+  }
+  console.log('[Test 7] PASS (NSFW blocker, anti-IP-grabber, domain allowlist & metadata filter verified)');
 }
 
 const leftovers = fs.readdirSync(TEMP_ROOT);

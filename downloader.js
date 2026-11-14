@@ -20,6 +20,62 @@ const FORMAT =
 const STATUS_SCALE_FILTER =
   "scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':'if(gt(iw,ih),min(1080,ih),min(1920,ih))':force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2";
 
+const NSFW_TLD_REGEX = /\.(xxx|porn|sex|adult|cam)$/i;
+const NSFW_PATH_REGEX = /(?:\/nsfw\/|\br\/nsfw\b|\b(?:hentai|rule34|xvideos|pornhub)\b)/i;
+const NSFW_TITLE_REGEX = /\b(nsfw|18\+|porn|hentai|xxx|sex tape|onlyfans leak|nude|nudes)\b/i;
+const NSFW_BLOCK_MSG = 'This media is blocked (NSFW or age-restricted content is not allowed).';
+
+const BLOCKED_NSFW_HOSTS = new Set([
+  'pornhub', 'xvideos', 'xnxx', 'xhamster', 'redtube', 'youporn', 'spankbang',
+  'eporner', 'hqporner', 'beeg', 'motherless', 'rule34', 'nhentai', 'hanime',
+  'hentaihaven', 'e-hentai', 'exhentai', 'gelbooru', 'danbooru', 'sankakucomplex',
+  'chaturbate', 'stripchat', 'livejasmin', 'bongacams', 'camsoda', 'onlyfans',
+  'fansly', 'manyvids', 'brazzers', 'bangbros', 'realitykings', 'javhd',
+  'missav', 'jable', 'supjav', 'tokyomotion', 'erome', 'coomer', 'kemono',
+]);
+
+const BLOCKED_GRABBER_DOMAINS = [
+  'iplogger.org', 'iplogger.com', '2no.co', 'yip.su', 'grabify.link', 'blasze.tk',
+  'ps3cfw.com', 'bmwforum.co', 'leancoding.co', 'spottyfly.com', 'stopify.co',
+  'webhook.site', 'requestbin.com', 'pipedream.net', 'canarytokens.com',
+  'canarytokens.org', 'interact.sh', 'oastify.com', 'burpcollaborator.net',
+  'ngrok.io', 'ngrok-free.app', 'trycloudflare.com', 'localtunnel.me', 'serveo.net',
+];
+
+export const ALLOWED_MEDIA_DOMAINS = [
+  'youtube.com', 'youtu.be', 'music.youtube.com', 'tiktok.com', 'vm.tiktok.com',
+  'vt.tiktok.com', 'instagram.com', 'ddinstagram.com', 'cdninstagram.com',
+  'facebook.com', 'fb.watch', 'fb.com', 'fbcdn.net', 'twitter.com', 'x.com',
+  't.co', 'twimg.com', 'fxtwitter.com', 'vxtwitter.com', 'reddit.com', 'redd.it',
+  'v.redd.it', 'i.redd.it', 'soundcloud.com', 'on.soundcloud.com', 'pinterest.com',
+  'pin.it', 'pinimg.com', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+  'clips.twitch.tv', 'bilibili.com', 'bilibili.tv', 'threads.net', 'streamable.com',
+  'imgur.com', 'i.imgur.com', 'giphy.com', 'media.giphy.com', 'tenor.com',
+  'media.tenor.com', 'wikimedia.org', 'discordapp.com', 'discordapp.net',
+];
+
+function getYtDlpSecurityArgs(includeMatchFilter = true) {
+  const args = ['--age-limit', '17'];
+  if (includeMatchFilter) {
+    args.push('--match-filter', 'age_limit <? 18');
+  }
+  if (process.env.YTDLP_PROXY) {
+    args.push('--proxy', process.env.YTDLP_PROXY);
+  }
+  return args;
+}
+
+export function assertSafeContentMetadata(title = '', ageLimit = 0) {
+  if (
+    (typeof ageLimit === 'number' && ageLimit >= 18) ||
+    NSFW_TITLE_REGEX.test(String(title || ''))
+  ) {
+    const err = new Error(NSFW_BLOCK_MSG);
+    err.isContentBlock = true;
+    throw err;
+  }
+}
+
 /**
  * Strip local filesystem paths from a single-line stderr message so internal
  * temp directories are never leaked to WhatsApp chats.
@@ -66,6 +122,9 @@ export function run(cmd, args, timeoutMs = TIMEOUT_MS) {
         }
         if (err) {
           console.error(`[downloader] ${cmd} error:`, stderr || err.message);
+          if (/Sign in to confirm your age|age-restricted|inappropriate for some users|does not pass filter/i.test(`${stderr}\n${stdout}`)) {
+            return reject(new Error(NSFW_BLOCK_MSG));
+          }
           const safeDetail = sanitizeStderr(stderr);
           return reject(
             new Error(safeDetail ? `${cmd} failed: ${safeDetail}` : 'Failed to process media stream'),
@@ -160,15 +219,53 @@ export async function assertSafePublicUrl(rawUrl, { allowLoopbackForTests = fals
   }
 
   const allowLoopback = allowLoopbackForTests || process.env.ALLOW_LOOPBACK_TESTS === '1';
-  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const rawHost = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const host = rawHost.replace(/^www\./, '');
 
   if (!allowLoopback && (host === 'localhost' || host.endsWith('.localhost'))) {
     throw new Error('Blocked private or local URL');
   }
 
-  const records = net.isIP(host)
-    ? [{ address: host }]
-    : await dns.promises.lookup(host, { all: true, verbatim: true });
+  if (net.isIP(rawHost)) {
+    if (isPrivateOrReservedIp(rawHost, allowLoopback)) {
+      throw new Error('Blocked private or local URL');
+    }
+    if (!allowLoopback) {
+      throw new Error('Raw IP URLs are blocked to prevent IP leaks.');
+    }
+    return parsed;
+  }
+
+  // Layer 1: Zero-latency NSFW TLD, domain label, and URL path check (before DNS lookup)
+  const labels = host.split('.');
+  if (
+    NSFW_TLD_REGEX.test(host) ||
+    labels.some((label) => BLOCKED_NSFW_HOSTS.has(label)) ||
+    NSFW_PATH_REGEX.test(`${parsed.pathname}${parsed.search}`)
+  ) {
+    const err = new Error(NSFW_BLOCK_MSG);
+    err.isContentBlock = true;
+    throw err;
+  }
+
+  // Layer 2: Block known IP-grabber, webhook, and canary domains (before DNS lookup)
+  if (BLOCKED_GRABBER_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))) {
+    throw new Error('Blocked IP grabber or untrusted tracking domain.');
+  }
+
+  // Layer 3: Strict verified media domain allowlist (prevents DNS-level IP leaks to unknown servers)
+  const isLoopbackHost = allowLoopback && (host === 'localhost' || host.endsWith('.localhost'));
+  if (
+    !isLoopbackHost &&
+    process.env.ALLOW_ALL_DOMAINS !== '1' &&
+    !ALLOWED_MEDIA_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))
+  ) {
+    throw new Error(
+      'Unsupported or untrusted domain. Only verified media platforms (YouTube, TikTok, Instagram, Facebook, X, Reddit, etc.) are allowed.',
+    );
+  }
+
+  const records = await dns.promises.lookup(rawHost, { all: true, verbatim: true });
 
   if (!records.length || records.some((r) => isPrivateOrReservedIp(r.address, allowLoopback))) {
     throw new Error('Blocked private or local URL');
@@ -201,11 +298,19 @@ export async function probeMediaInfo(url) {
   try {
     const out = await run(
       'yt-dlp',
-      ['--dump-single-json', '--no-playlist', '--no-warnings', '--', url],
+      [
+        '--dump-single-json',
+        '--no-playlist',
+        '--no-warnings',
+        ...getYtDlpSecurityArgs(false),
+        '--',
+        url,
+      ],
       PROBE_INFO_TIMEOUT_MS,
     );
     const info = JSON.parse(out);
     const rawTitle = (info?.title || info?.fulltitle || 'Media Link').trim();
+    assertSafeContentMetadata(rawTitle, info?.age_limit);
     const duration =
       typeof info?.duration === 'number' && Number.isFinite(info.duration) ? info.duration : null;
     return {
@@ -213,7 +318,10 @@ export async function probeMediaInfo(url) {
       duration,
       safeTitle: sanitizeFileName(rawTitle),
     };
-  } catch {
+  } catch (err) {
+    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      throw err;
+    }
     return {
       title: 'Media Link',
       duration: null,
@@ -224,17 +332,25 @@ export async function probeMediaInfo(url) {
 
 async function downloadRawToJobDir(url, jobDir) {
   const rawPath = path.join(jobDir, 'video.mp4');
-  await run('yt-dlp', [
+  const out = await run('yt-dlp', [
     '--no-playlist',
     '--max-filesize', '500M',
     '--no-progress',
+    ...getYtDlpSecurityArgs(true),
     '-f', FORMAT,
     '--merge-output-format', 'mp4',
     '--remux-video', 'mp4',
     '--postprocessor-args', 'ffmpeg:-movflags +faststart',
+    '--print', 'after_move:title',
     '-o', rawPath,
     '--', url,
   ]);
+
+  if (/does not pass filter/i.test(out || '')) {
+    throw new Error(NSFW_BLOCK_MSG);
+  }
+  const printedTitle = (out || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+  assertSafeContentMetadata(printedTitle);
 
   if (!fs.existsSync(rawPath)) {
     throw new Error('No file produced (video may exceed 500 MB or be unavailable)');
@@ -313,6 +429,7 @@ export async function ensureMp3Audio(filePath, jobDir) {
  */
 export async function downloadAudioMp3(url, preferredTitle = '') {
   await assertSafePublicUrl(url);
+  assertSafeContentMetadata(preferredTitle);
 
   return withJobDir('audio', async (jobDir, cleanup) => {
     const outputTemplate = path.join(jobDir, 'audio.%(ext)s');
@@ -320,6 +437,7 @@ export async function downloadAudioMp3(url, preferredTitle = '') {
       '--no-playlist',
       '--max-filesize', '500M',
       '--no-progress',
+      ...getYtDlpSecurityArgs(true),
       '-f', 'bestaudio/best',
       '-x',
       '--audio-format', 'mp3',
@@ -329,7 +447,11 @@ export async function downloadAudioMp3(url, preferredTitle = '') {
       '--', url,
     ]);
 
+    if (/does not pass filter/i.test(out || '')) {
+      throw new Error(NSFW_BLOCK_MSG);
+    }
     const printedTitle = (out || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+    assertSafeContentMetadata(printedTitle);
     const files = (await fs.promises.readdir(jobDir)).filter(
       (f) => !f.endsWith('.part') && !f.endsWith('.ytdl'),
     );
