@@ -3,7 +3,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import webp from 'node-webpmux';
-import { assertSafePublicUrl, run, TEMP_ROOT } from './downloader.js';
+import {
+  assertSafePublicUrl,
+  downloadVideo,
+  isPinterestUrl,
+  resolvePinterestMedia,
+  run,
+  TEMP_ROOT,
+} from './downloader.js';
 
 const MAX_FETCH_BYTES = 15 * 1024 * 1024; // 15 MB download ceiling
 const FETCH_TIMEOUT_MS = 15_000;
@@ -81,6 +88,29 @@ export async function isAnimatedMedia(filePath, mimeHint = '') {
  */
 export async function fetchImageFromUrl(url, jobDir) {
   let currentUrl = url;
+
+  if (isPinterestUrl(currentUrl) && !/\.(jpe?g|png|webp|gif)(\?|$)/i.test(currentUrl)) {
+    const pinMeta = await resolvePinterestMedia(currentUrl);
+    if (pinMeta?.kind === 'video') {
+      const vidMedia = await downloadVideo(pinMeta.canonicalUrl || currentUrl);
+      try {
+        const srcVid = vidMedia.filePath || vidMedia.slides?.[0];
+        if (!srcVid) {
+          throw new Error('Could not extract video stream from Pinterest Pin');
+        }
+        const inputPath = path.join(jobDir, `source${path.extname(srcVid) || '.mp4'}`);
+        await fs.promises.copyFile(srcVid, inputPath);
+        const isAnimated = await isAnimatedMedia(inputPath, 'video/mp4');
+        return { inputPath, isAnimated };
+      } finally {
+        await vidMedia.cleanup?.();
+      }
+    }
+    if (pinMeta?.images?.length > 0) {
+      currentUrl = pinMeta.images[0];
+    }
+  }
+
   let parsed;
   let res;
 
@@ -99,6 +129,7 @@ export async function fetchImageFromUrl(url, jobDir) {
 
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const location = res.headers.get('location');
+      res.body?.cancel?.().catch(() => {});
       if (!location || hop === MAX_REDIRECTS) {
         throw new Error('Too many or invalid redirects');
       }
@@ -119,6 +150,28 @@ export async function fetchImageFromUrl(url, jobDir) {
   const hasValidExt = ALLOWED_IMAGE_EXTS.has(urlExt);
 
   if (!extFromMime && !hasValidExt) {
+    if (contentType === 'text/html') {
+      res.body?.cancel?.().catch(() => {});
+      const pageMeta = await resolvePinterestMedia(currentUrl);
+      if (pageMeta?.kind === 'video') {
+        const vidMedia = await downloadVideo(pageMeta.canonicalUrl || currentUrl);
+        try {
+          const srcVid = vidMedia.filePath || vidMedia.slides?.[0];
+          if (!srcVid) {
+            throw new Error('Could not extract video stream from page');
+          }
+          const inputPath = path.join(jobDir, `source${path.extname(srcVid) || '.mp4'}`);
+          await fs.promises.copyFile(srcVid, inputPath);
+          const isAnimated = await isAnimatedMedia(inputPath, 'video/mp4');
+          return { inputPath, isAnimated };
+        } finally {
+          await vidMedia.cleanup?.();
+        }
+      }
+      if (pageMeta?.images?.length > 0 && pageMeta.images[0] !== currentUrl) {
+        return fetchImageFromUrl(pageMeta.images[0], jobDir);
+      }
+    }
     throw new Error('URL does not point to a supported image (JPEG, PNG, WebP, or GIF)');
   }
 

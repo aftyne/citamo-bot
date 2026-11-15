@@ -256,17 +256,17 @@ async function startSock() {
       const senderJid = msg.key.participant || remoteJid;
       const menuKey = `${remoteJid}_${senderJid}`;
 
-      // 1. Check if user is replying to an active .cdl menu (`1`, `2`, `mp4`, `mp3`)
+      // 1. Check if user is replying to an active .cdl menu (`1`, `2`, `mp4`, `mp3`, `img`)
       const choice = trimmed.toLowerCase();
       if (
         pendingCdlMenus.has(menuKey) &&
-        (choice === "1" || choice === "2" || choice === "mp4" || choice === "mp3")
+        (choice === "1" || choice === "2" || choice === "mp4" || choice === "mp3" || choice === "img")
       ) {
         const entry = pendingCdlMenus.get(menuKey);
         clearTimeout(entry.timer);
         pendingCdlMenus.delete(menuKey);
 
-        const format = choice === "1" || choice === "mp4" ? "mp4" : "mp3";
+        const format = choice === "1" || choice === "mp4" || choice === "img" ? "mp4" : "mp3";
         handleCdlDownload(msg, format, entry.url, entry.title).catch((e) =>
           console.error(".cdl menu handler error:", e),
         );
@@ -417,12 +417,16 @@ async function handleCdlDownload(msg, format, url, preferredTitle = "") {
             );
           }
         } else {
-          const { filePath, sizeInMB } = media;
-          console.log(`[.cdl mp4] Sending ${sizeInMB.toFixed(1)} MB video to ${jid}`);
+          const { filePath, sizeInMB, isGif } = media;
+          console.log(`[.cdl mp4] Sending ${sizeInMB.toFixed(1)} MB ${isGif ? "GIF" : "video"} to ${jid}`);
 
           const payload =
             sizeInMB <= INLINE_LIMIT_MB
-              ? { video: { url: filePath }, mimetype: "video/mp4" }
+              ? {
+                  video: { url: filePath },
+                  mimetype: "video/mp4",
+                  ...(isGif ? { gifPlayback: true } : {}),
+                }
               : {
                   document: { url: filePath },
                   mimetype: "video/mp4",

@@ -17,6 +17,7 @@ import {
   optimizeAndSplitForStatus,
   probeCodecs,
   probeMediaInfo,
+  resolvePinterestMedia,
   resolveTikTokUrl,
   run,
   TEMP_ROOT,
@@ -748,6 +749,126 @@ console.log('\n=== Test 9: TikTok /photo/ shortlink resolution & carousel downlo
       fail('Test 9c carousel jobDir still exists after cleanup');
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Pinterest Shortlink (pin.it), HTML og:image Fallback & .csc Sticker
+// ---------------------------------------------------------------------------
+console.log('\n=== Test 10: Pinterest (pin.it) video/image resolution & .csc HTML og:image fallback ===');
+{
+  // 10a: Local loopback HTML Pin page with og:image -> resolvePinterestMedia, createSticker & downloadAudioMp3 rejection
+  const pinSrvDir = path.join(TEMP_ROOT, `pinsrv_${crypto.randomUUID()}`);
+  fs.mkdirSync(pinSrvDir, { recursive: true });
+  const pinPngPath = path.join(pinSrvDir, 'pin_orig.png');
+
+  await run('ffmpeg', [
+    '-y',
+    '-f', 'lavfi', '-i', 'testsrc=duration=1:size=400x400:rate=1',
+    '-vframes', '1',
+    pinPngPath,
+  ]);
+  const pinPngBuf = await fs.promises.readFile(pinPngPath);
+
+  let pinPort = 0;
+  const pinServer = http.createServer((req, res) => {
+    const base = `http://127.0.0.1:${pinPort}`;
+    if (req.url === '/short-pin') {
+      res.writeHead(302, { Location: `${base}/pin/123456/` });
+      res.end();
+    } else if (req.url === '/pin/123456/') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(
+        `<!DOCTYPE html><html><head>` +
+          `<meta property="og:title" content="Aesthetic Pin Test" />` +
+          `<meta property="og:image" content="${base}/originals/ab/cd/pin_orig.png" />` +
+          `</head><body>Pinterest HTML Page</body></html>`,
+      );
+    } else if (req.url === '/originals/ab/cd/pin_orig.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': pinPngBuf.length });
+      res.end(pinPngBuf);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  await new Promise((resolve) => pinServer.listen(0, '127.0.0.1', resolve));
+  pinPort = pinServer.address().port;
+  const shortPinUrl = `http://127.0.0.1:${pinPort}/short-pin`;
+  process.env.ALLOW_LOOPBACK_TESTS = '1';
+
+  try {
+    const resolvedMeta = await resolvePinterestMedia(shortPinUrl);
+    console.log(
+      `[Test 10a] resolvePinterestMedia (HTML og:image): kind=${resolvedMeta?.kind} title="${resolvedMeta?.title}" images=${resolvedMeta?.images?.length}`,
+    );
+    if (!resolvedMeta || resolvedMeta.kind !== 'image' || resolvedMeta.images.length !== 1) {
+      fail(`Test 10a expected kind="image" with 1 og:image URL, got ${JSON.stringify(resolvedMeta)}`);
+    }
+
+    const htmlPinSticker = await createSticker({ url: shortPinUrl, crop: false });
+    const stImg = new webp.Image();
+    await stImg.load(htmlPinSticker);
+    console.log(
+      `[Test 10a] .csc on HTML Pin page -> ${stImg.width}x${stImg.height} WebP (${(htmlPinSticker.length / 1024).toFixed(1)}KB)`,
+    );
+    if (stImg.width !== 512 || stImg.height !== 512) {
+      fail(`Test 10a expected 512x512 WebP sticker from HTML Pin page, got ${stImg.width}x${stImg.height}`);
+    }
+
+    let mp3ImagePinRejected = false;
+    try {
+      await downloadAudioMp3(shortPinUrl);
+    } catch (err) {
+      mp3ImagePinRejected = /Pinterest Pin is an image and has no audio track/i.test(err.message);
+      console.log(`[Test 10a] downloadAudioMp3 on image Pin rejected cleanly: "${err.message}"`);
+    }
+    if (!mp3ImagePinRejected) {
+      fail('Test 10a expected downloadAudioMp3 on image-only Pin to throw clean user-facing error');
+    }
+  } finally {
+    delete process.env.ALLOW_LOOPBACK_TESTS;
+    await new Promise((resolve) => pinServer.close(resolve));
+    await fs.promises.rm(pinSrvDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+
+  // 10b: Live integration test on https://pin.it/4ddapNV2t
+  const livePinUrl = 'https://pin.it/4ddapNV2t';
+  const livePinInfo = await probeMediaInfo(livePinUrl);
+  console.log(`[Test 10b] probeMediaInfo("${livePinUrl}"): title="${livePinInfo.title}" duration=${livePinInfo.duration}`);
+
+  const livePinMedia = await downloadVideo(livePinUrl);
+  try {
+    const targetFile = livePinMedia.filePath || livePinMedia.slides?.[0];
+    const codecs = await probeCodecs(targetFile);
+    console.log(
+      `[Test 10b] downloadVideo("${livePinUrl}"): video=${codecs.video} audio=${codecs.audio}`,
+    );
+    if (!codecs.video) {
+      fail(`Test 10b expected valid video/image stream from ${livePinUrl}`);
+    }
+  } finally {
+    const jobDir = livePinMedia.filePath
+      ? path.dirname(livePinMedia.filePath)
+      : livePinMedia.slides?.[0]
+        ? path.dirname(livePinMedia.slides[0])
+        : null;
+    await livePinMedia.cleanup();
+    if (jobDir && fs.existsSync(jobDir)) {
+      fail('Test 10b livePinMedia jobDir still exists after cleanup');
+    }
+  }
+
+  const livePinSticker = await createSticker({ url: livePinUrl, crop: false });
+  const liveStImg = new webp.Image();
+  await liveStImg.load(livePinSticker);
+  console.log(
+    `[Test 10c] createSticker("${livePinUrl}"): ${liveStImg.width}x${liveStImg.height} anim=${liveStImg.hasAnim} size=${(livePinSticker.length / 1024).toFixed(1)}KB`,
+  );
+  if (liveStImg.width !== 512 || liveStImg.height !== 512) {
+    fail(`Test 10c expected 512x512 sticker from ${livePinUrl}, got ${liveStImg.width}x${liveStImg.height}`);
+  }
+  console.log('[Test 10] PASS (Pinterest shortlinks, HLS video/image pins, & .csc sticker extraction verified)');
 }
 
 const leftovers = fs.readdirSync(TEMP_ROOT);

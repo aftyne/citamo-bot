@@ -12,6 +12,7 @@ const PROBE_INFO_TIMEOUT_MS = 12_000; // 12s fast metadata probe timeout
 const MAX_CAROUSEL_SLIDES = 10;
 const MAX_SLIDE_BYTES = 10 * 1024 * 1024; // 10 MB per slide image
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25 MB max carousel audio
+const MAX_HTML_BYTES = 512 * 1024; // 512 KB cap for HTML metadata scraping
 const CAROUSEL_FETCH_TIMEOUT_MS = 15_000;
 const CAROUSEL_MAX_REDIRECTS = 5;
 const CAROUSEL_CONCURRENCY = 3;
@@ -21,7 +22,7 @@ fs.rmSync(TEMP_ROOT, { recursive: true, force: true });
 fs.mkdirSync(TEMP_ROOT, { recursive: true });
 
 const FORMAT =
-  "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4][vcodec^=avc]/best[ext=mp4]/best";
+  "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[ext=mp4][vcodec^=avc]+bestaudio/bestvideo+bestaudio/best[ext=mp4][vcodec^=avc]/best[ext=mp4]/best";
 
 const STATUS_SCALE_FILTER =
   "scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':'if(gt(iw,ih),min(1080,ih),min(1920,ih))':force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2";
@@ -137,6 +138,17 @@ export const ALLOWED_MEDIA_DOMAINS = [
   "soundcloud.com",
   "on.soundcloud.com",
   "pinterest.com",
+  "pinterest.co.uk",
+  "pinterest.ca",
+  "pinterest.de",
+  "pinterest.fr",
+  "pinterest.jp",
+  "pinterest.es",
+  "pinterest.it",
+  "pinterest.com.au",
+  "pinterest.com.mx",
+  "pinterest.co.kr",
+  "pinterest.ph",
   "pin.it",
   "pinimg.com",
   "vimeo.com",
@@ -603,6 +615,390 @@ export async function extractTikTokPhotoCarousel(url) {
   return null;
 }
 
+const PINTEREST_HOST_REGEX =
+  /^(?:[a-z0-9-]+\.)?(?:pinterest\.(?:com|co\.uk|ca|de|fr|jp|es|it|com\.au|com\.mx|co\.kr|ph)|pin\.it|pinimg\.com)$/i;
+
+export function isPinterestUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    return PINTEREST_HOST_REGEX.test(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+async function readBoundedHtml(res, maxBytes = MAX_HTML_BYTES) {
+  if (!res?.body) return "";
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    for await (const chunk of res.body) {
+      const buf = Buffer.from(chunk);
+      if (totalBytes + buf.byteLength > maxBytes) {
+        chunks.push(buf.subarray(0, maxBytes - totalBytes));
+        await res.body.cancel?.().catch(() => {});
+        break;
+      }
+      chunks.push(buf);
+      totalBytes += buf.byteLength;
+    }
+  } catch {
+    // Return partial HTML collected up to error/cancel
+  }
+  return Buffer.concat(chunks).toString("utf-8");
+}
+
+function decodeHtmlAttr(str) {
+  return String(str || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .trim();
+}
+
+async function upgradePinimgUrl(rawUrl) {
+  await assertSafePublicUrl(rawUrl);
+  const upgraded = rawUrl.replace(
+    /(\/\/i\.pinimg\.com\/)(?:236x|474x|564x|736x|600x315|136x136|60x60)\//i,
+    "$1originals/",
+  );
+  if (upgraded === rawUrl) return rawUrl;
+  try {
+    await assertSafePublicUrl(upgraded);
+    const res = await fetch(upgraded, {
+      method: "HEAD",
+      redirect: "manual",
+      referrerPolicy: "no-referrer",
+      signal: AbortSignal.timeout(5_000),
+      headers: { "User-Agent": BROWSER_USER_AGENT },
+    });
+    res.body?.cancel?.().catch(() => {});
+    if (res.ok) return upgraded;
+  } catch {
+    // Fall back to original thumbnail URL if /originals/ returns 403/404 or times out
+  }
+  return rawUrl;
+}
+
+/**
+ * Safely resolve Pinterest (pin.it, pinterest.com, pinimg.com) links or HTML Pin pages:
+ *   Step A: Follow manual redirects with assertSafePublicUrl and canonicalize /pin/<id>/
+ *   Step B: Tier 1 yt-dlp --ignore-no-formats-error --dump-single-json inspection
+ *   Step C: Tier 2 bounded (512 KB) HTML og:image / i.pinimg.com/originals/ fallback
+ * @returns {Promise<{ kind: 'video' | 'image' | 'carousel', images: string[], title: string, duration: number | null, canonicalUrl: string } | null>}
+ */
+export async function resolvePinterestMedia(url) {
+  const initialParsed = await assertSafePublicUrl(url);
+  const initialHost = initialParsed.hostname.toLowerCase();
+
+  // Direct i.pinimg.com image/GIF asset URL
+  if (
+    (initialHost === "i.pinimg.com" || initialHost.endsWith(".pinimg.com")) &&
+    /\.(jpe?g|png|webp|gif)(\?|$)/i.test(initialParsed.pathname)
+  ) {
+    const bestUrl = await upgradePinimgUrl(url);
+    return {
+      kind: "image",
+      images: [bestUrl],
+      title: "Pinterest Image",
+      duration: null,
+      canonicalUrl: bestUrl,
+    };
+  }
+
+  // Step A: Follow manual redirects safely
+  let currentUrl = url;
+  let currentParsed = initialParsed;
+  let finalResponse = null;
+
+  try {
+    for (let hop = 0; hop <= CAROUSEL_MAX_REDIRECTS; hop++) {
+      if (hop > 0) {
+        currentParsed = await assertSafePublicUrl(currentUrl);
+      }
+      const res = await fetch(currentUrl, {
+        redirect: "manual",
+        referrerPolicy: "no-referrer",
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          "User-Agent": BROWSER_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get("location");
+        res.body?.cancel?.().catch(() => {});
+        if (!location || hop === CAROUSEL_MAX_REDIRECTS) break;
+        currentUrl = new URL(location, currentParsed).toString();
+        continue;
+      }
+
+      finalResponse = res;
+      break;
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  let canonicalUrl = currentUrl;
+  try {
+    const parsedCanon = new URL(currentUrl);
+    const pinMatch = parsedCanon.pathname.match(/\/pin\/(?:[^/]*--)?(\d+)/i);
+    if (pinMatch && PINTEREST_HOST_REGEX.test(parsedCanon.hostname.toLowerCase())) {
+      canonicalUrl = `https://www.pinterest.com/pin/${pinMatch[1]}/`;
+      await assertSafePublicUrl(canonicalUrl);
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  const isPinterest = isPinterestUrl(url) || isPinterestUrl(canonicalUrl);
+
+  // Step B: Tier 1 Extraction via yt-dlp --ignore-no-formats-error --dump-single-json
+  if (isPinterest) {
+    try {
+      const out = await run(
+        "yt-dlp",
+        [
+          "--ignore-no-formats-error",
+          "--dump-single-json",
+          "--no-playlist",
+          "--no-warnings",
+          ...getYtDlpSecurityArgs(false),
+          "--",
+          canonicalUrl,
+        ],
+        15_000,
+      );
+      const info = JSON.parse(out);
+      const rawTitle = String(
+        info?.title || info?.fulltitle || info?.description || "Pinterest Pin",
+      ).trim();
+      assertSafeContentMetadata(rawTitle, info?.age_limit);
+      if (info?.description) {
+        assertSafeContentMetadata(String(info.description), info?.age_limit);
+      }
+
+      const formats = Array.isArray(info?.formats) ? info.formats : [];
+      const hasVideoStream = formats.some(
+        (f) =>
+          (f?.vcodec &&
+            f.vcodec !== "none" &&
+            !/^(jpg|jpeg|png|webp|gif)$/i.test(f.ext || "")) ||
+          (typeof f?.url === "string" &&
+            (/\.(mp4|m3u8)(\?|$)/i.test(f.url) || /\/\/v\d*\.pinimg\.com\//i.test(f.url)) &&
+            f?.vcodec !== "none"),
+      );
+
+      const duration =
+        typeof info?.duration === "number" && Number.isFinite(info.duration)
+          ? info.duration
+          : null;
+
+      if (hasVideoStream) {
+        finalResponse?.body?.cancel?.().catch(() => {});
+        return {
+          kind: "video",
+          images: [],
+          title: rawTitle || "Pinterest Video",
+          duration,
+          canonicalUrl,
+        };
+      }
+
+      const candidateUrls = [];
+      const pickBestThumb = (thumbs) => {
+        if (!Array.isArray(thumbs) || thumbs.length === 0) return null;
+        const orig = thumbs.find(
+          (t) => typeof t?.url === "string" && /\/originals\//i.test(t.url),
+        );
+        if (orig?.url) return orig.url;
+        const sorted = [...thumbs]
+          .filter((t) => typeof t?.url === "string" && /^https?:\/\//i.test(t.url))
+          .sort((a, b) => (Number(b.width) || 0) * (Number(b.height) || 0) - (Number(a.width) || 0) * (Number(a.height) || 0));
+        return sorted[0]?.url || thumbs[thumbs.length - 1]?.url || null;
+      };
+
+      if (Array.isArray(info?.entries) && info.entries.length > 0) {
+        for (const entry of info.entries) {
+          if (!entry) continue;
+          assertSafeContentMetadata(entry.title || "", entry.age_limit);
+          const entryHasVideo =
+            entry.vcodec &&
+            entry.vcodec !== "none" &&
+            !/^(jpg|jpeg|png|webp|gif)$/i.test(entry.ext || "");
+          if (entryHasVideo) {
+            finalResponse?.body?.cancel?.().catch(() => {});
+            return {
+              kind: "video",
+              images: [],
+              title: rawTitle || "Pinterest Video",
+              duration,
+              canonicalUrl,
+            };
+          }
+          const bestEntryImg =
+            pickBestThumb(entry.thumbnails) ||
+            (typeof entry.thumbnail === "string" ? entry.thumbnail : null) ||
+            (typeof entry.url === "string" && /\.(jpe?g|png|webp|gif)(\?|$)/i.test(entry.url)
+              ? entry.url
+              : null);
+          if (bestEntryImg) candidateUrls.push(bestEntryImg);
+        }
+      } else {
+        const bestSingleImg =
+          pickBestThumb(info?.thumbnails) ||
+          (typeof info?.thumbnail === "string" ? info.thumbnail : null) ||
+          (typeof info?.url === "string" && /\.(jpe?g|png|webp|gif)(\?|$)/i.test(info.url)
+            ? info.url
+            : null);
+        if (bestSingleImg) candidateUrls.push(bestSingleImg);
+      }
+
+      const validImages = [];
+      for (const rawImgUrl of [...new Set(candidateUrls)].slice(0, MAX_CAROUSEL_SLIDES)) {
+        try {
+          const upgraded = await upgradePinimgUrl(rawImgUrl);
+          validImages.push(upgraded);
+        } catch (err) {
+          if (err?.isContentBlock || /Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+            throw err;
+          }
+        }
+      }
+
+      if (validImages.length > 0) {
+        finalResponse?.body?.cancel?.().catch(() => {});
+        return {
+          kind: validImages.length > 1 ? "carousel" : "image",
+          images: validImages,
+          title: rawTitle || "Pinterest Image",
+          duration: null,
+          canonicalUrl,
+        };
+      }
+    } catch (err) {
+      if (err?.isContentBlock || /NSFW or age-restricted|Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+        finalResponse?.body?.cancel?.().catch(() => {});
+        throw err;
+      }
+    }
+  }
+
+  // Step C: Tier 2 Extraction — Bounded 512 KB HTML Scrape (og:image / __PWS_DATA__ / i.pinimg.com)
+  try {
+    let html = "";
+    if (finalResponse?.ok && finalResponse.url === canonicalUrl) {
+      html = await readBoundedHtml(finalResponse, MAX_HTML_BYTES);
+    } else {
+      finalResponse?.body?.cancel?.().catch(() => {});
+      await assertSafePublicUrl(canonicalUrl);
+      const htmlRes = await fetch(canonicalUrl, {
+        redirect: "manual",
+        referrerPolicy: "no-referrer",
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          "User-Agent": BROWSER_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+      if (htmlRes.ok) {
+        html = await readBoundedHtml(htmlRes, MAX_HTML_BYTES);
+      } else {
+        htmlRes.body?.cancel?.().catch(() => {});
+      }
+    }
+
+    if (html) {
+      const titleMatch =
+        html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i) ||
+        html.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const rawTitle = decodeHtmlAttr(titleMatch?.[1] || "Pinterest Image");
+      assertSafeContentMetadata(rawTitle, 0);
+
+      // Check for video Pin metadata first
+      const ogVideoMatch =
+        html.match(/<meta[^>]+property=["']og:video(?::url|:secure_url)?["'][^>]+content=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::url|:secure_url)?["']/i) ||
+        html.match(/https?:\/\/v\d*\.pinimg\.com\/videos\/[^\s"'<>\\]+\.mp4/i);
+      if (ogVideoMatch) {
+        const videoCandidate = decodeHtmlAttr(ogVideoMatch[1] || ogVideoMatch[0]);
+        await assertSafePublicUrl(videoCandidate);
+        return {
+          kind: "video",
+          images: [],
+          title: rawTitle || "Pinterest Video",
+          duration: null,
+          canonicalUrl,
+        };
+      }
+
+      const rawCandidates = [];
+      const ogImgRegex =
+        /<meta[^>]+(?:property=["']og:image["'][^>]+content=["']([^"']+)["']|content=["']([^"']+)["'][^>]+property=["']og:image["'])/gi;
+      let m;
+      while ((m = ogImgRegex.exec(html)) !== null) {
+        const u = decodeHtmlAttr(m[1] || m[2]);
+        if (u) rawCandidates.push(u);
+      }
+
+      const pinOrigMatches =
+        html.match(/https?:\/\/i\.pinimg\.com\/originals\/[a-zA-Z0-9/_.-]+\.(?:jpg|jpeg|png|webp|gif)/gi) || [];
+      for (const u of pinOrigMatches) {
+        rawCandidates.push(u);
+      }
+
+      if (rawCandidates.length === 0) {
+        const pin736Matches =
+          html.match(/https?:\/\/i\.pinimg\.com\/(?:736x|564x)\/[a-zA-Z0-9/_.-]+\.(?:jpg|jpeg|png|webp|gif)/gi) || [];
+        for (const u of pin736Matches) {
+          rawCandidates.push(u);
+        }
+      }
+
+      const resolvedUrls = [];
+      const seenKeys = new Set();
+      for (const candidate of rawCandidates) {
+        if (resolvedUrls.length >= MAX_CAROUSEL_SLIDES) break;
+        const absUrl = new URL(candidate, canonicalUrl).toString();
+        const dedupeKey = absUrl.replace(
+          /(\/\/i\.pinimg\.com\/)(?:originals|736x|564x|474x|236x)\//i,
+          "$1*/",
+        );
+        if (seenKeys.has(dedupeKey)) continue;
+        seenKeys.add(dedupeKey);
+
+        const upgraded = await upgradePinimgUrl(absUrl);
+        resolvedUrls.push(upgraded);
+      }
+
+      if (resolvedUrls.length > 0) {
+        return {
+          kind: resolvedUrls.length > 1 ? "carousel" : "image",
+          images: resolvedUrls,
+          title: rawTitle || "Pinterest Image",
+          duration: null,
+          canonicalUrl,
+        };
+      }
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /NSFW or age-restricted|Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Fast 12s metadata probe for `.cdl <url>` interactive menu.
  * Falls back gracefully to `{ title: 'Media Link', duration: null, safeTitle: 'audio' }`
@@ -634,6 +1030,36 @@ export async function probeMediaInfo(url) {
       safeTitle: "tiktok_carousel",
       isCarousel: true,
     };
+  }
+
+  if (isPinterestUrl(url) || isPinterestUrl(resolved.canonicalUrl)) {
+    try {
+      const pinMeta = await resolvePinterestMedia(resolved.canonicalUrl);
+      if (pinMeta) {
+        if (pinMeta.kind === "image" || pinMeta.kind === "carousel") {
+          const baseTitle = (pinMeta.title || "Pinterest Image").slice(0, 80);
+          const count = pinMeta.images.length;
+          return {
+            title: `${baseTitle} (${count} ${count === 1 ? "image" : "images"})`,
+            duration: null,
+            safeTitle: sanitizeFileName(baseTitle),
+            isCarousel: true,
+          };
+        }
+        if (pinMeta.kind === "video") {
+          const baseTitle = (pinMeta.title || "Pinterest Video").slice(0, 100);
+          return {
+            title: baseTitle,
+            duration: pinMeta.duration,
+            safeTitle: sanitizeFileName(baseTitle),
+          };
+        }
+      }
+    } catch (err) {
+      if (err?.isContentBlock || /NSFW or age-restricted|Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+        throw err;
+      }
+    }
   }
 
   try {
@@ -673,6 +1099,23 @@ export async function probeMediaInfo(url) {
           safeTitle: sanitizeFileName(baseTitle),
           isCarousel: true,
         };
+      }
+    }
+    try {
+      const pinMeta = await resolvePinterestMedia(resolved.canonicalUrl);
+      if (pinMeta?.images?.length) {
+        const baseTitle = (pinMeta.title || "Pinterest Image").slice(0, 80);
+        const count = pinMeta.images.length;
+        return {
+          title: `${baseTitle} (${count} ${count === 1 ? "image" : "images"})`,
+          duration: null,
+          safeTitle: sanitizeFileName(baseTitle),
+          isCarousel: true,
+        };
+      }
+    } catch (fallbackErr) {
+      if (fallbackErr?.isContentBlock || /NSFW or age-restricted/i.test(fallbackErr?.message)) {
+        throw fallbackErr;
       }
     }
     return {
@@ -883,26 +1326,46 @@ export async function downloadAudioMp3(url, preferredTitle = "") {
     }
 
     const outputTemplate = path.join(jobDir, "audio.%(ext)s");
-    const out = await run("yt-dlp", [
-      "--no-playlist",
-      "--max-filesize",
-      "500M",
-      "--no-progress",
-      ...getYtDlpSecurityArgs(true),
-      "-f",
-      "bestaudio/best",
-      "-x",
-      "--audio-format",
-      "mp3",
-      "--audio-quality",
-      "0",
-      "--print",
-      "after_move:title",
-      "-o",
-      outputTemplate,
-      "--",
-      resolved.canonicalUrl,
-    ]);
+    let out;
+    try {
+      out = await run("yt-dlp", [
+        "--no-playlist",
+        "--max-filesize",
+        "500M",
+        "--no-progress",
+        ...getYtDlpSecurityArgs(true),
+        "-f",
+        "bestaudio/best",
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "--print",
+        "after_move:title",
+        "-o",
+        outputTemplate,
+        "--",
+        resolved.canonicalUrl,
+      ]);
+    } catch (err) {
+      if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+        throw err;
+      }
+      if (
+        isPinterestUrl(url) ||
+        isPinterestUrl(resolved.canonicalUrl) ||
+        /Requested format is not available|Unsupported URL/i.test(err?.message)
+      ) {
+        const pinMeta = await resolvePinterestMedia(resolved.canonicalUrl).catch(() => null);
+        if (pinMeta && (pinMeta.kind === "image" || pinMeta.kind === "carousel")) {
+          throw new Error(
+            "This Pinterest Pin is an image and has no audio track. Use .c, .csc, or reply 1 to download the image.",
+          );
+        }
+      }
+      throw err;
+    }
 
     if (/does not pass filter/i.test(out || "")) {
       throw new Error(NSFW_BLOCK_MSG);
@@ -986,8 +1449,8 @@ async function downloadSafeBinary(url, destPath, maxBytes) {
 }
 
 /**
- * Inspect TikTok Photo Mode (two-tier HTML + tikwm.com API) or yt-dlp JSON
- * for multi-entry carousels to extract slide image URLs and background audio URL.
+ * Inspect TikTok Photo Mode (two-tier HTML + tikwm.com API), Pinterest Pins, or yt-dlp JSON
+ * for multi-entry carousels / image posts to extract slide image URLs and background audio URL.
  */
 async function extractCarouselMetadata(url) {
   const resolved = await resolveTikTokUrl(url);
@@ -1003,11 +1466,25 @@ async function extractCarouselMetadata(url) {
     }
   }
 
+  // Pinterest image / GIF / carousel fallback
+  if (isPinterestUrl(url) || isPinterestUrl(resolved.canonicalUrl)) {
+    const pinMeta = await resolvePinterestMedia(resolved.canonicalUrl);
+    if (pinMeta?.images?.length) {
+      return {
+        slideUrls: pinMeta.images,
+        audioUrl: null,
+        title: pinMeta.title,
+        canonicalUrl: pinMeta.canonicalUrl,
+      };
+    }
+  }
+
   // Try yt-dlp JSON inspection for non-TikTok-photo multi-entry carousels
   try {
     const out = await run(
       "yt-dlp",
       [
+        "--ignore-no-formats-error",
         "--dump-single-json",
         "--playlist-items",
         "1-15",
@@ -1031,11 +1508,11 @@ async function extractCarouselMetadata(url) {
         const hasRealVideo =
           entry.vcodec &&
           entry.vcodec !== "none" &&
-          !/^(jpg|jpeg|png|webp)$/i.test(entry.ext || "");
+          !/^(jpg|jpeg|png|webp|gif)$/i.test(entry.ext || "");
         if (hasRealVideo) continue;
 
         const imgCandidate =
-          (entry.url && /\.(jpe?g|png|webp)(\?|$)/i.test(entry.url) ? entry.url : null) ||
+          (entry.url && /\.(jpe?g|png|webp|gif)(\?|$)/i.test(entry.url) ? entry.url : null) ||
           entry.thumbnails?.slice(-1)[0]?.url ||
           entry.thumbnail ||
           null;
@@ -1049,10 +1526,16 @@ async function extractCarouselMetadata(url) {
     } else if (info && (!info.vcodec || info.vcodec === "none")) {
       const formats = Array.isArray(info.formats) ? info.formats : [];
       for (const fmt of formats) {
-        if (fmt?.url && /\.(jpe?g|png|webp)(\?|$)/i.test(fmt.url)) {
+        if (fmt?.url && /\.(jpe?g|png|webp|gif)(\?|$)/i.test(fmt.url)) {
           slideUrls.push(fmt.url);
         } else if (!audioUrl && fmt?.acodec && fmt.acodec !== "none" && fmt?.url) {
           audioUrl = fmt.url;
+        }
+      }
+      if (slideUrls.length === 0 && Array.isArray(info.thumbnails) && info.thumbnails.length > 0) {
+        const bestThumb = info.thumbnails[info.thumbnails.length - 1]?.url;
+        if (bestThumb && /^https?:\/\//i.test(bestThumb)) {
+          slideUrls.push(bestThumb);
         }
       }
     }
@@ -1064,6 +1547,17 @@ async function extractCarouselMetadata(url) {
     if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
     }
+  }
+
+  // Final HTML og:image fallback if yt-dlp produced no slides
+  const htmlMeta = await resolvePinterestMedia(resolved.canonicalUrl);
+  if (htmlMeta?.images?.length) {
+    return {
+      slideUrls: htmlMeta.images,
+      audioUrl: null,
+      title: htmlMeta.title,
+      canonicalUrl: htmlMeta.canonicalUrl,
+    };
   }
 
   return null;
@@ -1123,6 +1617,41 @@ async function resolveCarouselPost(url, jobDir, existingAudioPath = null) {
       if (rewritten) audioPath = rewritten.filePath;
     } catch {
       audioPath = null;
+    }
+  }
+
+  if (slides.length === 1) {
+    const firstUrl = targetUrls[0] || "";
+    const firstCodecs = await probeCodecs(slides[0]);
+    if (/\.gif(\?|$)/i.test(firstUrl) || firstCodecs.video === "gif") {
+      const gifMp4 = path.join(jobDir, "gif_loop.mp4");
+      await run("ffmpeg", [
+        "-y",
+        "-i",
+        slides[0],
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-level:v",
+        "4.1",
+        "-preset",
+        "fast",
+        "-crf",
+        "20",
+        "-an",
+        "-movflags",
+        "+faststart",
+        gifMp4,
+      ]);
+      const sizeInMB = fs.statSync(gifMp4).size / (1024 * 1024);
+      return {
+        filePath: gifMp4,
+        sizeInMB,
+        isGif: true,
+      };
     }
   }
 
@@ -1388,9 +1917,10 @@ export async function downloadAndOptimizeForStatus(url) {
           fs.existsSync(rawCandidate) ? rawCandidate : null,
         );
         if (carousel) {
+          const slideList = carousel.slides || (carousel.filePath ? [carousel.filePath] : []);
           const parts = await buildCarouselStatusVideo(
-            carousel.slides,
-            carousel.audioPath,
+            slideList,
+            carousel.audioPath || null,
             jobDir,
           );
           return { parts, cleanup };
@@ -1403,7 +1933,8 @@ export async function downloadAndOptimizeForStatus(url) {
     if (!carousel) {
       throw new Error("Could not extract slides from photo carousel post");
     }
-    const parts = await buildCarouselStatusVideo(carousel.slides, carousel.audioPath, jobDir);
+    const slideList = carousel.slides || (carousel.filePath ? [carousel.filePath] : []);
+    const parts = await buildCarouselStatusVideo(slideList, carousel.audioPath || null, jobDir);
     return { parts, cleanup };
   });
 }
