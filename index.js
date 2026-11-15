@@ -15,7 +15,11 @@ import {
   downloadAudioMp3,
   probeMediaInfo,
 } from "./downloader.js";
-import { createSticker } from "./sticker.js";
+import {
+  createSticker,
+  convertStickerToMedia,
+  MAX_STICKER_CONVERT_BYTES,
+} from "./sticker.js";
 
 const INLINE_LIMIT_MB = 50;
 const MAX_STICKER_BYTES = 15 * 1024 * 1024;
@@ -29,19 +33,23 @@ const CS_USAGE =
   "Usage: Send .cs <url> to download a Status HD video (auto-splits >60s).";
 const STICKER_USAGE =
   'Usage: Reply to an image/GIF with .csc, send an image with caption .csc, or send .csc <image-url> (add "crop" for square crop).';
+const STICKER_TO_MEDIA_USAGE =
+  "Usage: Reply to a sticker with .cimg (to PNG), .cvid (to MP4 video), or .cgif (to looping GIF).";
 const CDL_USAGE =
   "Usage: Send .cdl <url> (for interactive MP4/MP3 menu) or .cdl mp4 <url> / .cdl mp3 <url>.";
 const HELP_TEXT = `🤖 *CITAMO BOT — COMMANDS*
 
-🎬 *Video & Audio*
-• \`.c <url>\` — Download HD video
-• \`.cs <url>\` — Status HD video (auto-splits >60s)
+🎬 *Video, Audio & Carousels*
+• \`.c <url>\` — HD video or photo carousel
+• \`.cs <url>\` — Status HD (auto-splits >60s & builds slideshow video from photo posts)
 • \`.cdl <url>\` — Choose MP4 or MP3 menu
 • \`.cdl mp4/mp3 <url>\` — Direct MP4 or MP3
 
 🖼️ *Stickers* _(reply, caption, or URL)_
 • \`.csc [url]\` — Full-frame sticker
 • \`.csc crop [url]\` — Square-cropped sticker
+• \`.cimg\` — Sticker to PNG image _(reply)_
+• \`.cvid / .cgif\` — Animated sticker to MP4/GIF _(reply)_
 
 💡 *Supports:* YouTube, TikTok, IG, FB, X, Reddit, SoundCloud & more.`;
 
@@ -303,6 +311,11 @@ async function startSock() {
         handleStickerCommand(msg, content, { crop, url }).catch((e) =>
           console.error("Sticker handler error:", e),
         );
+      } else if (cmd === ".cimg" || cmd === ".cvid" || cmd === ".cgif") {
+        const targetFormat = cmd === ".cimg" ? "img" : cmd === ".cvid" ? "vid" : "gif";
+        handleStickerToMediaCommand(msg, content, targetFormat).catch((e) =>
+          console.error(`${cmd} handler error:`, e),
+        );
       } else if (cmd === ".cdl") {
         const arg1 = tokens[1];
         const arg2 = tokens[2];
@@ -334,11 +347,13 @@ async function handleCdlMenu(msg, menuKey, url) {
   try {
     const info = await withJobSlot(() => probeMediaInfo(url));
     const durationText = formatDuration(info.duration);
+    const opt1 = info.isCarousel ? "*img*" : "*mp4*";
+    const opt1Label = info.isCarousel ? "Photo + Audio" : "HD Video (MP4)";
 
     const menuText =
       `🎬 *${info.title}*${durationText}\n\n` +
       `Reply with:\n` +
-      `*1* or *mp4* — HD Video (MP4)\n` +
+      `*1* or ${opt1} — ${opt1Label}\n` +
       `*2* or *mp3* — Audio Only (MP3)\n\n` +
       `_(Expires in 2 minutes)_`;
 
@@ -370,19 +385,52 @@ async function handleCdlDownload(msg, format, url, preferredTitle = "") {
     await withJobSlot(async () => {
       if (format === "mp4") {
         media = await downloadVideo(url);
-        const { filePath, sizeInMB } = media;
-        console.log(`[.cdl mp4] Sending ${sizeInMB.toFixed(1)} MB video to ${jid}`);
+        if (media.kind === "carousel") {
+          console.log(
+            `[.cdl mp4] Sending ${media.slides.length} carousel slide(s) to ${jid}`,
+          );
+          for (let i = 0; i < media.slides.length; i++) {
+            const slidePath = media.slides[i];
+            const extraNote =
+              i === 0 && media.totalAvailSlides > media.slides.length
+                ? ` (Showing first ${media.slides.length} of ${media.totalAvailSlides} slides)`
+                : "";
+            const caption = `📸 Slide ${i + 1}/${media.slides.length}${extraNote}`;
+            await sendSafe(
+              jid,
+              { image: { url: slidePath }, caption },
+              { quoted: msg },
+            );
+            if (i < media.slides.length - 1 || media.audioPath) {
+              await new Promise((r) => setTimeout(r, 350));
+            }
+          }
+          if (media.audioPath) {
+            await sendSafe(
+              jid,
+              {
+                audio: { url: media.audioPath },
+                mimetype: "audio/mpeg",
+                ptt: false,
+              },
+              { quoted: msg },
+            );
+          }
+        } else {
+          const { filePath, sizeInMB } = media;
+          console.log(`[.cdl mp4] Sending ${sizeInMB.toFixed(1)} MB video to ${jid}`);
 
-        const payload =
-          sizeInMB <= INLINE_LIMIT_MB
-            ? { video: { url: filePath }, mimetype: "video/mp4" }
-            : {
-                document: { url: filePath },
-                mimetype: "video/mp4",
-                fileName: "video_hd.mp4",
-                caption: "✅ HD Video (Sent as document to preserve original quality)",
-              };
-        await sendSafe(jid, payload, { quoted: msg });
+          const payload =
+            sizeInMB <= INLINE_LIMIT_MB
+              ? { video: { url: filePath }, mimetype: "video/mp4" }
+              : {
+                  document: { url: filePath },
+                  mimetype: "video/mp4",
+                  fileName: "video_hd.mp4",
+                  caption: "✅ HD Video (Sent as document to preserve original quality)",
+                };
+          await sendSafe(jid, payload, { quoted: msg });
+        }
       } else {
         media = await downloadAudioMp3(url, preferredTitle);
         const { filePath, sizeInMB, fileName } = media;
@@ -507,6 +555,101 @@ async function handleStickerCommand(msg, content, { crop, url }) {
       { text: `❌ Sticker failed: ${err.message.slice(0, 200)}` },
       { quoted: msg },
     ).catch(() => {});
+  }
+}
+
+async function handleStickerToMediaCommand(msg, content, targetFormat) {
+  const jid = msg.key.remoteJid;
+  const react = (emoji) => sendSafe(jid, { react: { text: emoji, key: msg.key } });
+
+  const contextInfo =
+    content.extendedTextMessage?.contextInfo ||
+    content.imageMessage?.contextInfo ||
+    content.videoMessage?.contextInfo ||
+    content.documentMessage?.contextInfo ||
+    content.stickerMessage?.contextInfo;
+
+  const unwrappedQuoted = contextInfo?.quotedMessage
+    ? extractMessageContent(contextInfo.quotedMessage)
+    : null;
+  const stickerNode = unwrappedQuoted?.stickerMessage;
+
+  if (!stickerNode) {
+    await sendSafe(jid, { text: STICKER_TO_MEDIA_USAGE }, { quoted: msg }).catch(() => {});
+    return;
+  }
+
+  await react("⏳");
+  let media;
+  try {
+    if (Number(stickerNode.fileLength || 0) > MAX_STICKER_CONVERT_BYTES) {
+      throw new Error("Sticker exceeds 2 MB limit for conversion");
+    }
+
+    const targetMsg = {
+      key: {
+        remoteJid: jid,
+        id: contextInfo.stanzaId,
+        participant: contextInfo.participant,
+      },
+      message: unwrappedQuoted,
+    };
+
+    await withJobSlot(async () => {
+      const sock = await getReadySock();
+      const stickerBuffer = await downloadMediaMessage(
+        targetMsg,
+        "buffer",
+        {},
+        { logger, reuploadRequest: sock.updateMediaMessage },
+      );
+      if (stickerBuffer.length > MAX_STICKER_CONVERT_BYTES) {
+        throw new Error("Sticker exceeds 2 MB limit for conversion");
+      }
+
+      media = await convertStickerToMedia(stickerBuffer, targetFormat);
+
+      if (targetFormat === "img") {
+        await sendSafe(
+          jid,
+          { image: { url: media.filePath }, caption: "🖼️ Converted from sticker" },
+          { quoted: msg },
+        );
+      } else if (targetFormat === "vid") {
+        await sendSafe(
+          jid,
+          {
+            video: { url: media.filePath },
+            mimetype: "video/mp4",
+            caption: "🎬 Converted from animated sticker",
+          },
+          { quoted: msg },
+        );
+      } else {
+        await sendSafe(
+          jid,
+          {
+            video: { url: media.filePath },
+            mimetype: "video/mp4",
+            gifPlayback: true,
+            caption: "👾 Converted to GIF",
+          },
+          { quoted: msg },
+        );
+      }
+    });
+
+    await react("✅");
+  } catch (err) {
+    console.error(`Command .c${targetFormat} failed:`, err.message);
+    await react("❌").catch(() => {});
+    await sendSafe(
+      jid,
+      { text: `❌ Conversion failed: ${err.message.slice(0, 200)}` },
+      { quoted: msg },
+    ).catch(() => {});
+  } finally {
+    if (media?.cleanup) await media.cleanup();
   }
 }
 

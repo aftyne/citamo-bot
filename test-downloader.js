@@ -7,18 +7,21 @@ import webp from 'node-webpmux';
 import {
   assertSafeContentMetadata,
   assertSafePublicUrl,
+  buildCarouselStatusVideo,
   downloadVideo,
   downloadAndOptimizeForStatus,
   downloadAudioMp3,
   ensureMp3Audio,
   ensureWhatsAppCodecs,
+  extractTikTokPhotoCarousel,
   optimizeAndSplitForStatus,
   probeCodecs,
   probeMediaInfo,
+  resolveTikTokUrl,
   run,
   TEMP_ROOT,
 } from './downloader.js';
-import { createSticker } from './sticker.js';
+import { convertStickerToMedia, createSticker } from './sticker.js';
 
 const url = process.argv[2] || 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // "Me at the zoo", 19s
 let ok = true;
@@ -503,7 +506,7 @@ console.log('\n=== Test 7: NSFW blocker, IP-grabber defense, raw-IP block & doma
   try {
     await assertSafePublicUrl('https://my-evil-ip-logger.com/video.mp4');
   } catch (err) {
-    untrustedBlocked = /Unsupported or untrusted domain/i.test(err.message);
+    untrustedBlocked = /Unsupported(?: or untrusted)? domain/i.test(err.message);
   }
   if (!untrustedBlocked) {
     fail('Test 7b expected unknown domain to be rejected by allowlist before DNS lookup');
@@ -543,6 +546,208 @@ console.log('\n=== Test 7: NSFW blocker, IP-grabber defense, raw-IP block & doma
     fail('Test 7d expected youtube.com to pass assertSafePublicUrl');
   }
   console.log('[Test 7] PASS (NSFW blocker, anti-IP-grabber, domain allowlist & metadata filter verified)');
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Sticker-to-Media (.cimg / .cvid / .cgif) & Carousel Status Stitcher
+// ---------------------------------------------------------------------------
+console.log('\n=== Test 8: Sticker-to-Media (.cimg, .cvid, .cgif) & Carousel Status MP4 ===');
+{
+  const synthDir = path.join(TEMP_ROOT, `test8_${crypto.randomUUID()}`);
+  fs.mkdirSync(synthDir, { recursive: true });
+
+  try {
+    const pngPath = path.join(synthDir, 'src.png');
+    const gifPath = path.join(synthDir, 'src.gif');
+
+    await run('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=640x480:rate=1',
+      '-vframes', '1',
+      pngPath,
+    ]);
+    await run('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      gifPath,
+    ]);
+
+    const staticWebp = await createSticker({
+      buffer: await fs.promises.readFile(pngPath),
+      mime: 'image/png',
+      isAnimated: false,
+    });
+    const animWebp = await createSticker({
+      buffer: await fs.promises.readFile(gifPath),
+      mime: 'image/gif',
+      isAnimated: true,
+    });
+
+    // 8a: Static sticker -> .cimg (PNG)
+    const imgMedia = await convertStickerToMedia(staticWebp, 'img');
+    const imgJobDir = path.dirname(imgMedia.filePath);
+    try {
+      const codecs = await probeCodecs(imgMedia.filePath);
+      console.log(`[Test 8a] .cimg output codec=${codecs.video} mime=${imgMedia.mimetype}`);
+      if (codecs.video !== 'png' || imgMedia.mimetype !== 'image/png' || imgMedia.isGifPlayback !== false) {
+        fail(`Test 8a expected PNG output, got codec=${codecs.video} mime=${imgMedia.mimetype}`);
+      }
+    } finally {
+      await imgMedia.cleanup();
+      if (fs.existsSync(imgJobDir)) {
+        fail('Test 8a st2media jobDir still exists after cleanup');
+      }
+    }
+
+    // 8b: Static sticker passed to .cvid must reject cleanly
+    let staticToVidRejected = false;
+    try {
+      await convertStickerToMedia(staticWebp, 'vid');
+    } catch (err) {
+      staticToVidRejected = /static sticker.*Use \.cimg/i.test(err.message);
+      console.log(`[Test 8b] static sticker -> .cvid rejected as expected: "${err.message}"`);
+    }
+    if (!staticToVidRejected) {
+      fail('Test 8b expected static sticker passed to convertStickerToMedia(..., "vid") to reject');
+    }
+
+    // 8c: Animated sticker -> .cvid & .cgif
+    for (const fmt of ['vid', 'gif']) {
+      const vidMedia = await convertStickerToMedia(animWebp, fmt);
+      const vidJobDir = path.dirname(vidMedia.filePath);
+      try {
+        const probeOut = await run('ffprobe', [
+          '-v', 'error',
+          '-select_streams', 'v:0',
+          '-count_frames',
+          '-show_entries', 'stream=codec_name,nb_read_frames,width,height',
+          '-of', 'json',
+          vidMedia.filePath,
+        ]);
+        const stream = JSON.parse(probeOut).streams?.[0] || {};
+        const frames = Number(stream.nb_read_frames || 0);
+        console.log(
+          `[Test 8c] .c${fmt} codec=${stream.codec_name} ${stream.width}x${stream.height} frames=${frames} gifPlayback=${vidMedia.isGifPlayback}`,
+        );
+        if (
+          stream.codec_name !== 'h264' ||
+           !(frames > 5) ||
+          vidMedia.isGifPlayback !== (fmt === 'gif')
+        ) {
+          fail(`Test 8c invalid .c${fmt} output: codec=${stream.codec_name} frames=${frames}`);
+        }
+      } finally {
+        await vidMedia.cleanup();
+        if (fs.existsSync(vidJobDir)) {
+          fail(`Test 8c .c${fmt} jobDir still exists after cleanup`);
+        }
+      }
+    }
+
+    // 8d: Carousel Slideshow Synthesis (3 synthetic JPEGs + 5s audio -> 1080x1920 h264+aac MP4)
+    const carouselDir = path.join(TEMP_ROOT, `carousel_${crypto.randomUUID()}`);
+    fs.mkdirSync(carouselDir, { recursive: true });
+    try {
+      const slides = [];
+      for (let i = 1; i <= 3; i++) {
+        const slidePath = path.join(carouselDir, `slide_${i}.jpg`);
+        await run('ffmpeg', [
+          '-y',
+          '-f', 'lavfi', '-i', `testsrc=duration=1:size=800x600:rate=1`,
+          '-vframes', '1',
+          slidePath,
+        ]);
+        slides.push(slidePath);
+      }
+      const audioTrack = path.join(carouselDir, 'bgm.mp3');
+      await run('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=5',
+        '-c:a', 'libmp3lame', '-q:a', '2',
+        audioTrack,
+      ]);
+
+      const parts = await buildCarouselStatusVideo(slides, audioTrack, carouselDir);
+      if (parts.length !== 1) {
+        fail(`Test 8d expected 1 status part for 3-slide carousel, got ${parts.length}`);
+      }
+      const probeOut = await run('ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'stream=codec_type,codec_name,width,height:format=duration',
+        '-of', 'json',
+        parts[0].filePath,
+      ]);
+      const parsed = JSON.parse(probeOut);
+      const vStream = parsed.streams?.find((s) => s.codec_type === 'video') || {};
+      const aStream = parsed.streams?.find((s) => s.codec_type === 'audio') || {};
+      console.log(
+        `[Test 8d] Carousel Status MP4: ${vStream.width}x${vStream.height} video=${vStream.codec_name} audio=${aStream.codec_name} duration=${Number(parsed.format?.duration || 0).toFixed(1)}s`,
+      );
+      if (
+        vStream.codec_name !== 'h264' ||
+        aStream.codec_name !== 'aac' ||
+        vStream.width !== 1080 ||
+        vStream.height !== 1920
+      ) {
+        fail(
+          `Test 8d expected 1080x1920 h264+aac carousel MP4, got ${vStream.width}x${vStream.height} ${vStream.codec_name}+${aStream.codec_name}`,
+        );
+      }
+    } finally {
+      await fs.promises.rm(carouselDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+
+    console.log('[Test 8] PASS (.cimg, .cvid, .cgif & 1080x1920 Carousel Status MP4 verified)');
+  } finally {
+    await fs.promises.rm(synthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: TikTok Shortlink & /photo/ Carousel Resolution (No Unsupported URL)
+// ---------------------------------------------------------------------------
+console.log('\n=== Test 9: TikTok /photo/ shortlink resolution & carousel download ===');
+{
+  const ttShortUrl = 'https://vt.tiktok.com/ZSpqgVJGW/';
+  const resolved = await resolveTikTokUrl(ttShortUrl);
+  console.log(
+    `[Test 9a] resolveTikTokUrl: canonical="${resolved.canonicalUrl}" isPhotoMode=${resolved.isPhotoMode} photoId=${resolved.photoId}`,
+  );
+  if (!resolved.isPhotoMode || resolved.photoId !== '7699701644761533703') {
+    fail(`Test 9a expected isPhotoMode=true and photoId=7699701644761533703, got ${JSON.stringify(resolved)}`);
+  }
+
+  const probe = await probeMediaInfo(ttShortUrl);
+  console.log(`[Test 9b] probeMediaInfo: title="${probe.title}" isCarousel=${probe.isCarousel}`);
+  if (!probe.isCarousel) {
+    fail('Test 9b expected probeMediaInfo to mark TikTok /photo/ URL as isCarousel=true');
+  }
+
+  const carouselMedia = await downloadVideo(ttShortUrl);
+  try {
+    console.log(
+      `[Test 9c] downloadVideo: kind=${carouselMedia.kind} slides=${carouselMedia.slides?.length}/${carouselMedia.totalAvailSlides} audio=${Boolean(carouselMedia.audioPath)}`,
+    );
+    if (carouselMedia.kind !== 'carousel' || !carouselMedia.slides?.length) {
+      fail(`Test 9c expected kind="carousel" with slides, got kind=${carouselMedia.kind}`);
+    } else {
+      const firstSlideCodecs = await probeCodecs(carouselMedia.slides[0]);
+      if (!firstSlideCodecs.video) {
+        fail('Test 9c expected first carousel slide to be a valid image');
+      }
+      console.log('[Test 9] PASS (TikTok /photo/ shortlink resolved & downloaded without Unsupported URL error)');
+    }
+  } finally {
+    const jobDir = carouselMedia.slides?.[0]
+      ? path.dirname(carouselMedia.slides[0])
+      : carouselMedia.filePath
+        ? path.dirname(carouselMedia.filePath)
+        : null;
+    await carouselMedia.cleanup();
+    if (jobDir && fs.existsSync(jobDir)) {
+      fail('Test 9c carousel jobDir still exists after cleanup');
+    }
+  }
 }
 
 const leftovers = fs.readdirSync(TEMP_ROOT);

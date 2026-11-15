@@ -9,6 +9,12 @@ import path from "node:path";
 export const TEMP_ROOT = path.join(process.cwd(), "temp");
 const TIMEOUT_MS = 180_000; // 180s hard limit per external process
 const PROBE_INFO_TIMEOUT_MS = 12_000; // 12s fast metadata probe timeout
+const MAX_CAROUSEL_SLIDES = 10;
+const MAX_SLIDE_BYTES = 10 * 1024 * 1024; // 10 MB per slide image
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25 MB max carousel audio
+const CAROUSEL_FETCH_TIMEOUT_MS = 15_000;
+const CAROUSEL_MAX_REDIRECTS = 5;
+const CAROUSEL_CONCURRENCY = 3;
 
 // Startup sweep: clear orphans from previous crashes, then ensure ./temp exists.
 fs.rmSync(TEMP_ROOT, { recursive: true, force: true });
@@ -22,7 +28,7 @@ const STATUS_SCALE_FILTER =
 
 const NSFW_TLD_REGEX = /\.(xxx|porn|sex|adult|cam)$/i;
 const NSFW_PATH_REGEX = /(?:\/nsfw\/|\br\/nsfw\b|\b(?:hentai|rule34|xvideos|pornhub)\b)/i;
-const NSFW_TITLE_REGEX = /\b(nsfw|18\+|porn|hentai|xxx|sex tape|onlyfans leak|nude|nudes)\b/i;
+const NSFW_TITLE_REGEX = /\b(nsfw|18\+|porn|hentai|xxx|sex tape|onlyfans|nude|nudes)\b/i;
 const NSFW_BLOCK_MSG = "This media is blocked (NSFW or age-restricted content is not allowed).";
 
 const BLOCKED_NSFW_HOSTS = new Set([
@@ -101,9 +107,19 @@ export const ALLOWED_MEDIA_DOMAINS = [
   "tiktok.com",
   "vm.tiktok.com",
   "vt.tiktok.com",
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "tiktokcdn-eu.com",
+  "tiktokv.com",
+  "tikwm.com",
+  "musical.ly",
+  "ibytedtos.com",
+  "byteoversea.com",
+  "muscdn.com",
   "instagram.com",
   "ddinstagram.com",
   "cdninstagram.com",
+  "scontent.cdninstagram.com",
   "facebook.com",
   "fb.watch",
   "fb.com",
@@ -358,7 +374,7 @@ export async function assertSafePublicUrl(rawUrl, { allowLoopbackForTests = fals
     !ALLOWED_MEDIA_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))
   ) {
     throw new Error(
-      " Unsupported domain. Only verified platforms (YouTube, TikTok, Instagram, X, etc.) are allowed.",
+      "Unsupported domain. Only verified platforms (YouTube, TikTok, Instagram, Facebook, X, Reddit, etc.) are allowed.",
     );
   }
 
@@ -385,13 +401,241 @@ async function withJobDir(prefix, fn) {
   }
 }
 
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+function matchTikTokPhotoId(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const m = u.pathname.match(/\/photo\/(\d+)/i);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Safely resolve TikTok shortlinks (vt.tiktok.com, vm.tiktok.com, etc.) with
+ * manual redirect hops validated by assertSafePublicUrl, and detect /photo/<id> mode.
+ * @returns {Promise<{ canonicalUrl: string, isPhotoMode: boolean, photoId: string | null }>}
+ */
+export async function resolveTikTokUrl(url) {
+  let currentParsed = await assertSafePublicUrl(url);
+  const host = currentParsed.hostname.toLowerCase().replace(/^www\./, "");
+  const isTikTok = host === "tiktok.com" || host.endsWith(".tiktok.com");
+
+  const initialPhotoId = matchTikTokPhotoId(url);
+  if (initialPhotoId) {
+    return { canonicalUrl: url, isPhotoMode: true, photoId: initialPhotoId };
+  }
+  if (!isTikTok) {
+    return { canonicalUrl: url, isPhotoMode: false, photoId: null };
+  }
+
+  let currentUrl = url;
+  try {
+    for (let hop = 0; hop <= CAROUSEL_MAX_REDIRECTS; hop++) {
+      if (hop > 0) {
+        currentParsed = await assertSafePublicUrl(currentUrl);
+      }
+      const hopPhotoId = matchTikTokPhotoId(currentUrl);
+      if (hopPhotoId) {
+        return { canonicalUrl: currentUrl, isPhotoMode: true, photoId: hopPhotoId };
+      }
+
+      const res = await fetch(currentUrl, {
+        redirect: "manual",
+        referrerPolicy: "no-referrer",
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          "User-Agent": BROWSER_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get("location");
+        res.body?.cancel?.().catch(() => {});
+        if (!location || hop === CAROUSEL_MAX_REDIRECTS) break;
+        currentUrl = new URL(location, currentParsed).toString();
+        continue;
+      }
+
+      res.body?.cancel?.().catch(() => {});
+      break;
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /Blocked|Unsupported|Raw IP/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  const finalPhotoId = matchTikTokPhotoId(currentUrl);
+  return {
+    canonicalUrl: currentUrl,
+    isPhotoMode: Boolean(finalPhotoId),
+    photoId: finalPhotoId,
+  };
+}
+
+/**
+ * Two-tier TikTok Photo Mode (/photo/<id>) extractor that never invokes yt-dlp on /photo/ URLs:
+ *   Tier 1: Direct HTML __UNIVERSAL_DATA_FOR_REHYDRATION__ scrape
+ *   Tier 2: Automatic JSON API fallback via tikwm.com
+ * @returns {Promise<{ slideUrls: string[], audioUrl: string | null, title: string, canonicalUrl: string } | null>}
+ */
+export async function extractTikTokPhotoCarousel(url) {
+  const { canonicalUrl } = await resolveTikTokUrl(url);
+
+  // Tier 1: Direct HTML Hydration Scrape (__UNIVERSAL_DATA_FOR_REHYDRATION__)
+  try {
+    let currentUrl = canonicalUrl;
+    let parsed;
+    let res;
+    for (let hop = 0; hop <= CAROUSEL_MAX_REDIRECTS; hop++) {
+      parsed = await assertSafePublicUrl(currentUrl);
+      res = await fetch(currentUrl, {
+        redirect: "manual",
+        referrerPolicy: "no-referrer",
+        signal: AbortSignal.timeout(CAROUSEL_FETCH_TIMEOUT_MS),
+        headers: {
+          "User-Agent": BROWSER_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get("location");
+        res.body?.cancel?.().catch(() => {});
+        if (!location || hop === CAROUSEL_MAX_REDIRECTS) break;
+        currentUrl = new URL(location, parsed).toString();
+        continue;
+      }
+      break;
+    }
+
+    if (res?.ok) {
+      const html = await res.text();
+      const match = html.match(
+        /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i,
+      );
+      if (match?.[1]) {
+        const data = JSON.parse(match[1]);
+        const detail =
+          data?.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct ||
+          data?.__DEFAULT_SCOPE__?.["webapp.reflow.video.detail"]?.itemInfo?.itemStruct;
+        if (detail) {
+          if (detail.isContentClassified) {
+            assertSafeContentMetadata("", 18);
+          }
+          const rawTitle = String(
+            detail.desc || detail.imagePost?.title || "TikTok Photo Carousel",
+          ).trim();
+          assertSafeContentMetadata(rawTitle, 0);
+
+          const images = detail.imagePost?.images;
+          if (Array.isArray(images) && images.length > 0) {
+            const slideUrls = images
+              .map((img) => img?.imageURL?.urlList?.find((u) => /^https?:\/\//i.test(u)))
+              .filter(Boolean);
+            const audioUrl =
+              detail.music?.playUrl && /^https?:\/\//i.test(detail.music.playUrl)
+                ? detail.music.playUrl
+                : null;
+            if (slideUrls.length > 0) {
+              return {
+                slideUrls,
+                audioUrl,
+                title: rawTitle || "TikTok Photo Carousel",
+                canonicalUrl,
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  // Tier 2: Automatic JSON API Fallback (tikwm.com)
+  try {
+    const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(canonicalUrl)}`;
+    await assertSafePublicUrl(apiUrl);
+    const res = await fetch(apiUrl, {
+      referrerPolicy: "no-referrer",
+      signal: AbortSignal.timeout(12_000),
+      headers: {
+        "User-Agent": BROWSER_USER_AGENT,
+        Accept: "application/json",
+      },
+    });
+    if (res.ok) {
+      const json = await res.json();
+      const images = json?.data?.images;
+      if (Array.isArray(images) && images.length > 0) {
+        const rawTitle = String(json.data.title || "TikTok Photo Carousel").trim();
+        assertSafeContentMetadata(rawTitle, 0);
+        const slideUrls = images.filter(
+          (u) => typeof u === "string" && /^https?:\/\//i.test(u),
+        );
+        const audioUrl =
+          [json.data.music, json.data.music_info?.play, json.data.play].find(
+            (u) => typeof u === "string" && /^https?:\/\//i.test(u),
+          ) || null;
+        if (slideUrls.length > 0) {
+          return {
+            slideUrls,
+            audioUrl,
+            title: rawTitle || "TikTok Photo Carousel",
+            canonicalUrl,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Fast 12s metadata probe for `.cdl <url>` interactive menu.
  * Falls back gracefully to `{ title: 'Media Link', duration: null, safeTitle: 'audio' }`
  * on timeout or extractor rate-limits so the menu is never blocked.
  */
 export async function probeMediaInfo(url) {
-  await assertSafePublicUrl(url);
+  const resolved = await resolveTikTokUrl(url);
+
+  if (resolved.isPhotoMode) {
+    try {
+      const meta = await extractTikTokPhotoCarousel(resolved.canonicalUrl);
+      if (meta?.slideUrls?.length) {
+        const baseTitle = (meta.title || "TikTok Photo Carousel").slice(0, 80);
+        return {
+          title: `${baseTitle} (${meta.slideUrls.length} slides)`,
+          duration: null,
+          safeTitle: sanitizeFileName(baseTitle),
+          isCarousel: true,
+        };
+      }
+    } catch (err) {
+      if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+        throw err;
+      }
+    }
+    return {
+      title: "TikTok Photo Carousel",
+      duration: null,
+      safeTitle: "tiktok_carousel",
+      isCarousel: true,
+    };
+  }
+
   try {
     const out = await run(
       "yt-dlp",
@@ -401,7 +645,7 @@ export async function probeMediaInfo(url) {
         "--no-warnings",
         ...getYtDlpSecurityArgs(false),
         "--",
-        url,
+        resolved.canonicalUrl,
       ],
       PROBE_INFO_TIMEOUT_MS,
     );
@@ -418,6 +662,18 @@ export async function probeMediaInfo(url) {
   } catch (err) {
     if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
+    }
+    if (/tiktok\.com/i.test(resolved.canonicalUrl)) {
+      const meta = await extractTikTokPhotoCarousel(resolved.canonicalUrl);
+      if (meta?.slideUrls?.length) {
+        const baseTitle = (meta.title || "TikTok Photo Carousel").slice(0, 80);
+        return {
+          title: `${baseTitle} (${meta.slideUrls.length} slides)`,
+          duration: null,
+          safeTitle: sanitizeFileName(baseTitle),
+          isCarousel: true,
+        };
+      }
     }
     return {
       title: "Media Link",
@@ -546,15 +802,86 @@ export async function ensureMp3Audio(filePath, jobDir) {
   return mp3Path;
 }
 
+async function extractTikTokAudioViaVideoRewrite(canonicalUrl, jobDir) {
+  if (!/\/photo\/\d+/i.test(canonicalUrl)) return null;
+  const videoUrl = canonicalUrl.replace(/\/photo\/(\d+)/i, "/video/$1");
+  const outputTemplate = path.join(jobDir, "tt_audio.%(ext)s");
+  const out = await run("yt-dlp", [
+    "--no-playlist",
+    "--max-filesize",
+    "500M",
+    "--no-progress",
+    ...getYtDlpSecurityArgs(true),
+    "-f",
+    "bestaudio/best",
+    "-x",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "0",
+    "--print",
+    "after_move:title",
+    "-o",
+    outputTemplate,
+    "--",
+    videoUrl,
+  ]);
+  if (/does not pass filter/i.test(out || "")) {
+    throw new Error(NSFW_BLOCK_MSG);
+  }
+  const printedTitle = (out || "").trim().split(/\r?\n/).filter(Boolean).pop() || "";
+  assertSafeContentMetadata(printedTitle);
+  const files = (await fs.promises.readdir(jobDir)).filter(
+    (f) => f.startsWith("tt_audio.") && !f.endsWith(".part") && !f.endsWith(".ytdl"),
+  );
+  if (files.length === 0) return null;
+  const filePath = await ensureMp3Audio(path.join(jobDir, files[0]), jobDir);
+  return { filePath, printedTitle };
+}
+
 /**
  * Download high-quality MP3 audio for `.cdl` (`2` / `mp3`).
  * @returns {Promise<{ filePath: string, sizeInMB: number, fileName: string, cleanup: () => Promise<void> }>}
  */
 export async function downloadAudioMp3(url, preferredTitle = "") {
-  await assertSafePublicUrl(url);
+  const resolved = await resolveTikTokUrl(url);
   assertSafeContentMetadata(preferredTitle);
 
   return withJobDir("audio", async (jobDir, cleanup) => {
+    if (resolved.isPhotoMode) {
+      let filePath = null;
+      let fallbackTitle = "";
+      const meta = await extractTikTokPhotoCarousel(resolved.canonicalUrl);
+      if (meta?.title) fallbackTitle = meta.title;
+      if (meta?.audioUrl) {
+        try {
+          const rawAudio = path.join(jobDir, "carousel_audio_raw.bin");
+          await downloadSafeBinary(meta.audioUrl, rawAudio, MAX_AUDIO_BYTES);
+          filePath = await ensureMp3Audio(rawAudio, jobDir);
+        } catch {
+          filePath = null;
+        }
+      }
+      if (!filePath) {
+        const rewritten = await extractTikTokAudioViaVideoRewrite(resolved.canonicalUrl, jobDir);
+        if (rewritten) {
+          filePath = rewritten.filePath;
+          if (!fallbackTitle) fallbackTitle = rewritten.printedTitle;
+        }
+      }
+      if (!filePath) {
+        throw new Error("No audio track found in this TikTok photo post");
+      }
+      const sizeInMB = fs.statSync(filePath).size / (1024 * 1024);
+      const safeTitle = sanitizeFileName(preferredTitle || fallbackTitle || "audio");
+      return {
+        filePath,
+        sizeInMB,
+        fileName: `${safeTitle}.mp3`,
+        cleanup,
+      };
+    }
+
     const outputTemplate = path.join(jobDir, "audio.%(ext)s");
     const out = await run("yt-dlp", [
       "--no-playlist",
@@ -574,7 +901,7 @@ export async function downloadAudioMp3(url, preferredTitle = "") {
       "-o",
       outputTemplate,
       "--",
-      url,
+      resolved.canonicalUrl,
     ]);
 
     if (/does not pass filter/i.test(out || "")) {
@@ -604,17 +931,380 @@ export async function downloadAudioMp3(url, preferredTitle = "") {
 }
 
 /**
- * Download a WhatsApp-safe (H.264/AAC MP4) video for `.c <url>` or `.cdl` (`1` / `mp4`).
- * @returns {Promise<{ filePath: string, sizeInMB: number, cleanup: () => Promise<void> }>}
+ * Safely download a remote binary asset (image slide or audio track) with
+ * manual redirect validation via assertSafePublicUrl and streaming size cap.
+ */
+async function downloadSafeBinary(url, destPath, maxBytes) {
+  let currentUrl = url;
+  let parsed;
+  let res;
+
+  for (let hop = 0; hop <= CAROUSEL_MAX_REDIRECTS; hop++) {
+    parsed = await assertSafePublicUrl(currentUrl);
+    res = await fetch(currentUrl, {
+      redirect: "manual",
+      referrerPolicy: "no-referrer",
+      signal: AbortSignal.timeout(CAROUSEL_FETCH_TIMEOUT_MS),
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      },
+    });
+
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const location = res.headers.get("location");
+      if (!location || hop === CAROUSEL_MAX_REDIRECTS) {
+        throw new Error("Too many or invalid redirects while fetching carousel asset");
+      }
+      currentUrl = new URL(location, parsed).toString();
+      continue;
+    }
+    break;
+  }
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to fetch carousel asset (HTTP ${res.status})`);
+  }
+
+  const contentLength = Number(res.headers.get("content-length") || 0);
+  if (contentLength > maxBytes) {
+    throw new Error("Carousel asset exceeds maximum allowed size");
+  }
+
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of res.body) {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBytes) {
+      throw new Error("Carousel asset exceeds maximum allowed size");
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+
+  await fs.promises.writeFile(destPath, Buffer.concat(chunks));
+  return destPath;
+}
+
+/**
+ * Inspect TikTok Photo Mode (two-tier HTML + tikwm.com API) or yt-dlp JSON
+ * for multi-entry carousels to extract slide image URLs and background audio URL.
+ */
+async function extractCarouselMetadata(url) {
+  const resolved = await resolveTikTokUrl(url);
+
+  // Never call yt-dlp on a TikTok /photo/ URL (yt-dlp throws Unsupported URL)
+  if (resolved.isPhotoMode || /tiktok\.com/i.test(resolved.canonicalUrl)) {
+    const ttMeta = await extractTikTokPhotoCarousel(resolved.canonicalUrl);
+    if (ttMeta?.slideUrls?.length) {
+      return ttMeta;
+    }
+    if (resolved.isPhotoMode) {
+      return null;
+    }
+  }
+
+  // Try yt-dlp JSON inspection for non-TikTok-photo multi-entry carousels
+  try {
+    const out = await run(
+      "yt-dlp",
+      [
+        "--dump-single-json",
+        "--playlist-items",
+        "1-15",
+        "--no-warnings",
+        ...getYtDlpSecurityArgs(false),
+        "--",
+        resolved.canonicalUrl,
+      ],
+      20_000,
+    );
+    const info = JSON.parse(out);
+    assertSafeContentMetadata(info?.title || info?.fulltitle || "", info?.age_limit);
+
+    const slideUrls = [];
+    let audioUrl = null;
+
+    if (Array.isArray(info?.entries) && info.entries.length > 0) {
+      for (const entry of info.entries) {
+        if (!entry) continue;
+        assertSafeContentMetadata(entry.title || "", entry.age_limit);
+        const hasRealVideo =
+          entry.vcodec &&
+          entry.vcodec !== "none" &&
+          !/^(jpg|jpeg|png|webp)$/i.test(entry.ext || "");
+        if (hasRealVideo) continue;
+
+        const imgCandidate =
+          (entry.url && /\.(jpe?g|png|webp)(\?|$)/i.test(entry.url) ? entry.url : null) ||
+          entry.thumbnails?.slice(-1)[0]?.url ||
+          entry.thumbnail ||
+          null;
+        if (imgCandidate && /^https?:\/\//i.test(imgCandidate)) {
+          slideUrls.push(imgCandidate);
+        }
+        if (!audioUrl && entry.acodec && entry.acodec !== "none" && entry.url) {
+          audioUrl = entry.url;
+        }
+      }
+    } else if (info && (!info.vcodec || info.vcodec === "none")) {
+      const formats = Array.isArray(info.formats) ? info.formats : [];
+      for (const fmt of formats) {
+        if (fmt?.url && /\.(jpe?g|png|webp)(\?|$)/i.test(fmt.url)) {
+          slideUrls.push(fmt.url);
+        } else if (!audioUrl && fmt?.acodec && fmt.acodec !== "none" && fmt?.url) {
+          audioUrl = fmt.url;
+        }
+      }
+    }
+
+    if (slideUrls.length > 0) {
+      return { slideUrls, audioUrl, canonicalUrl: resolved.canonicalUrl };
+    }
+  } catch (err) {
+    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      throw err;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Download up to MAX_CAROUSEL_SLIDES (10) validated slide images (concurrency 3)
+ * and optional background MP3 audio into jobDir.
+ */
+async function resolveCarouselPost(url, jobDir, existingAudioPath = null) {
+  const meta = await extractCarouselMetadata(url);
+  if (!meta || !meta.slideUrls?.length) return null;
+
+  const totalAvailSlides = meta.slideUrls.length;
+  const targetUrls = meta.slideUrls.slice(0, MAX_CAROUSEL_SLIDES);
+  const slides = new Array(targetUrls.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < targetUrls.length) {
+      const idx = cursor++;
+      const slideUrl = targetUrls[idx];
+      const slidePath = path.join(jobDir, `slide_${String(idx + 1).padStart(3, "0")}.jpg`);
+      await downloadSafeBinary(slideUrl, slidePath, MAX_SLIDE_BYTES);
+      const { video } = await probeCodecs(slidePath);
+      if (!video) {
+        throw new Error(`Downloaded carousel slide ${idx + 1} is not a valid image`);
+      }
+      slides[idx] = slidePath;
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(CAROUSEL_CONCURRENCY, targetUrls.length) }, () => worker()),
+  );
+
+  let audioPath = null;
+  if (existingAudioPath && fs.existsSync(existingAudioPath)) {
+    try {
+      audioPath = await ensureMp3Audio(existingAudioPath, jobDir);
+    } catch {
+      audioPath = null;
+    }
+  }
+  if (!audioPath && meta.audioUrl) {
+    try {
+      const rawAudio = path.join(jobDir, "carousel_audio_raw.bin");
+      await downloadSafeBinary(meta.audioUrl, rawAudio, MAX_AUDIO_BYTES);
+      audioPath = await ensureMp3Audio(rawAudio, jobDir);
+    } catch {
+      audioPath = null;
+    }
+  }
+  if (!audioPath && meta.canonicalUrl && /\/photo\/\d+/i.test(meta.canonicalUrl)) {
+    try {
+      const rewritten = await extractTikTokAudioViaVideoRewrite(meta.canonicalUrl, jobDir);
+      if (rewritten) audioPath = rewritten.filePath;
+    } catch {
+      audioPath = null;
+    }
+  }
+
+  return {
+    kind: "carousel",
+    slides,
+    totalAvailSlides,
+    audioPath,
+  };
+}
+
+async function splitStatusIfOver60s(optimizedFilePath, jobDir) {
+  const { duration } = await probeCodecs(optimizedFilePath);
+  if (duration <= 60) {
+    return [{ filePath: optimizedFilePath, partNumber: 1, totalParts: 1 }];
+  }
+
+  const segmentPattern = path.join(jobDir, "status_part_%03d.mp4");
+  await run("ffmpeg", [
+    "-y",
+    "-i",
+    optimizedFilePath,
+    "-c",
+    "copy",
+    "-map",
+    "0",
+    "-segment_time",
+    "58",
+    "-f",
+    "segment",
+    "-reset_timestamps",
+    "1",
+    segmentPattern,
+  ]);
+
+  // Fix #8: immediately remove unsplit optimized file after segmentation
+  await fs.promises.unlink(optimizedFilePath);
+
+  const segmentFiles = (await fs.promises.readdir(jobDir))
+    .filter((name) => /^status_part_\d+\.mp4$/.test(name))
+    .sort();
+
+  if (segmentFiles.length === 0) {
+    throw new Error("Failed to split Status video into segments");
+  }
+
+  const totalParts = segmentFiles.length;
+  return segmentFiles.map((name, idx) => ({
+    filePath: path.join(jobDir, name),
+    partNumber: idx + 1,
+    totalParts,
+  }));
+}
+
+/**
+ * Render carousel slide images + optional background audio into a 1080x1920
+ * WhatsApp Status HD slideshow MP4 (3.0s per slide) and auto-split if > 60s.
+ * @returns {Promise<Array<{ filePath: string, partNumber: number, totalParts: number }>>}
+ */
+export async function buildCarouselStatusVideo(slides, audioPath, jobDir) {
+  if (!Array.isArray(slides) || slides.length === 0) {
+    throw new Error("No slides provided for Status slideshow");
+  }
+
+  const normPaths = [];
+  for (let i = 0; i < slides.length; i++) {
+    const normName = `norm_${String(i + 1).padStart(3, "0")}.jpg`;
+    const normPath = path.join(jobDir, normName);
+    await run("ffmpeg", [
+      "-y",
+      "-i",
+      slides[i],
+      "-frames:v",
+      "1",
+      "-vf",
+      "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p",
+      "-q:v",
+      "2",
+      normPath,
+    ]);
+    normPaths.push({ normName, normPath });
+  }
+
+  const concatLines = ["ffconcat version 1.0"];
+  for (const item of normPaths) {
+    concatLines.push(`file '${item.normName}'`);
+    concatLines.push("duration 3.0");
+  }
+  concatLines.push(`file '${normPaths[normPaths.length - 1].normName}'`);
+
+  const concatTxtPath = path.join(jobDir, "slides_concat.txt");
+  await fs.promises.writeFile(concatTxtPath, `${concatLines.join("\n")}\n`);
+
+  const totalDurationSec = slides.length * 3;
+  const slideshowPath = path.join(jobDir, "carousel_status.mp4");
+  const hasAudio = Boolean(audioPath && fs.existsSync(audioPath));
+  const audioInputArgs = hasAudio
+    ? ["-stream_loop", "-1", "-i", audioPath]
+    : ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"];
+
+  await run("ffmpeg", [
+    "-y",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    concatTxtPath,
+    ...audioInputArgs,
+    "-t",
+    String(totalDurationSec),
+    "-c:v",
+    "libx264",
+    "-profile:v",
+    "high",
+    "-level:v",
+    "4.2",
+    "-r",
+    "30",
+    "-crf",
+    "21",
+    "-maxrate",
+    "3800k",
+    "-bufsize",
+    "7600k",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-ac",
+    "2",
+    "-shortest",
+    "-movflags",
+    "+faststart",
+    slideshowPath,
+  ]);
+
+  for (const item of normPaths) {
+    await fs.promises.unlink(item.normPath).catch(() => {});
+  }
+
+  return splitStatusIfOver60s(slideshowPath, jobDir);
+}
+
+/**
+ * Download a WhatsApp-safe (H.264/AAC MP4) video or multi-slide photo carousel
+ * for `.c <url>` or `.cdl` (`1` / `mp4`).
  */
 export async function downloadVideo(url) {
-  await assertSafePublicUrl(url);
+  const resolved = await resolveTikTokUrl(url);
 
   return withJobDir("", async (jobDir, cleanup) => {
-    const rawPath = await downloadRawToJobDir(url, jobDir);
-    const filePath = await ensureWhatsAppCodecs(rawPath, jobDir);
-    const sizeInMB = fs.statSync(filePath).size / (1024 * 1024);
-    return { filePath, sizeInMB, cleanup };
+    if (!resolved.isPhotoMode) {
+      try {
+        const rawPath = await downloadRawToJobDir(resolved.canonicalUrl, jobDir);
+        const filePath = await ensureWhatsAppCodecs(rawPath, jobDir);
+        const sizeInMB = fs.statSync(filePath).size / (1024 * 1024);
+        return { filePath, sizeInMB, cleanup };
+      } catch (err) {
+        if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+          throw err;
+        }
+        const rawCandidate = path.join(jobDir, "video.mp4");
+        const carousel = await resolveCarouselPost(
+          resolved.canonicalUrl,
+          jobDir,
+          fs.existsSync(rawCandidate) ? rawCandidate : null,
+        );
+        if (carousel) {
+          return { ...carousel, cleanup };
+        }
+        throw err;
+      }
+    }
+
+    const carousel = await resolveCarouselPost(resolved.canonicalUrl, jobDir);
+    if (!carousel) {
+      throw new Error("Could not extract slides from photo carousel post");
+    }
+    return { ...carousel, cleanup };
   });
 }
 
@@ -670,58 +1360,50 @@ export async function optimizeAndSplitForStatus(rawFilePath, jobDir) {
   // Fix #8: immediately remove raw source file so two copies never sit on disk
   await fs.promises.unlink(rawFilePath);
 
-  const { duration } = await probeCodecs(optimizedFilePath);
-  if (duration <= 60) {
-    return [{ filePath: optimizedFilePath, partNumber: 1, totalParts: 1 }];
-  }
-
-  const segmentPattern = path.join(jobDir, "status_part_%03d.mp4");
-  await run("ffmpeg", [
-    "-y",
-    "-i",
-    optimizedFilePath,
-    "-c",
-    "copy",
-    "-map",
-    "0",
-    "-segment_time",
-    "58",
-    "-f",
-    "segment",
-    "-reset_timestamps",
-    "1",
-    segmentPattern,
-  ]);
-
-  // Fix #8: immediately remove unsplit optimized file after segmentation
-  await fs.promises.unlink(optimizedFilePath);
-
-  const segmentFiles = (await fs.promises.readdir(jobDir))
-    .filter((name) => /^status_part_\d+\.mp4$/.test(name))
-    .sort();
-
-  if (segmentFiles.length === 0) {
-    throw new Error("Failed to split Status video into segments");
-  }
-
-  const totalParts = segmentFiles.length;
-  return segmentFiles.map((name, idx) => ({
-    filePath: path.join(jobDir, name),
-    partNumber: idx + 1,
-    totalParts,
-  }));
+  return splitStatusIfOver60s(optimizedFilePath, jobDir);
 }
 
 /**
- * Download, optimize for WhatsApp Status HD (preserving native FPS), and auto-split if > 60s.
+ * Download, optimize for WhatsApp Status HD (preserving native FPS or building a
+ * 1080x1920 slideshow from photo carousels), and auto-split if > 60s.
  * @returns {Promise<{ parts: Array<{ filePath: string, partNumber: number, totalParts: number }>, cleanup: () => Promise<void> }>}
  */
 export async function downloadAndOptimizeForStatus(url) {
-  await assertSafePublicUrl(url);
+  const resolved = await resolveTikTokUrl(url);
 
   return withJobDir("", async (jobDir, cleanup) => {
-    const rawFilePath = await downloadRawToJobDir(url, jobDir);
-    const parts = await optimizeAndSplitForStatus(rawFilePath, jobDir);
+    if (!resolved.isPhotoMode) {
+      try {
+        const rawFilePath = await downloadRawToJobDir(resolved.canonicalUrl, jobDir);
+        const parts = await optimizeAndSplitForStatus(rawFilePath, jobDir);
+        return { parts, cleanup };
+      } catch (err) {
+        if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+          throw err;
+        }
+        const rawCandidate = path.join(jobDir, "video.mp4");
+        const carousel = await resolveCarouselPost(
+          resolved.canonicalUrl,
+          jobDir,
+          fs.existsSync(rawCandidate) ? rawCandidate : null,
+        );
+        if (carousel) {
+          const parts = await buildCarouselStatusVideo(
+            carousel.slides,
+            carousel.audioPath,
+            jobDir,
+          );
+          return { parts, cleanup };
+        }
+        throw err;
+      }
+    }
+
+    const carousel = await resolveCarouselPost(resolved.canonicalUrl, jobDir);
+    if (!carousel) {
+      throw new Error("Could not extract slides from photo carousel post");
+    }
+    const parts = await buildCarouselStatusVideo(carousel.slides, carousel.audioPath, jobDir);
     return { parts, cleanup };
   });
 }

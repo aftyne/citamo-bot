@@ -10,6 +10,9 @@ const FETCH_TIMEOUT_MS = 15_000;
 const MAX_REDIRECTS = 5;
 const STATIC_MAX_BYTES = 98 * 1024; // < 100 KB target for static stickers
 const ANIMATED_MAX_BYTES = 485 * 1024; // < 500 KB target (with EXIF headroom) for animated stickers
+export const MAX_STICKER_CONVERT_BYTES = 2 * 1024 * 1024; // 2 MB max input sticker size for .cimg/.cvid/.cgif
+const MAX_ANIMATED_FRAMES = 150;
+const MAX_OUTPUT_DURATION_SEC = 10;
 
 const ALLOWED_IMAGE_MIMES = new Map([
   ['image/jpeg', '.jpg'],
@@ -307,5 +310,156 @@ export async function createSticker({
     return finalBuffer;
   } finally {
     await fs.promises.rm(jobDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+  }
+}
+
+/**
+ * Convert a WhatsApp WebP sticker buffer into a static PNG ('img'), H.264 MP4 ('vid'),
+ * or looping MP4 GIF ('gif') using node-webpmux to unpack ANIM/ANMF chunks safely.
+ * @param {Buffer} stickerBuffer
+ * @param {'img' | 'vid' | 'gif'} targetFormat
+ * @returns {Promise<{ filePath: string, mimetype: string, isGifPlayback: boolean, cleanup: () => Promise<void> }>}
+ */
+export async function convertStickerToMedia(stickerBuffer, targetFormat) {
+  if (!Buffer.isBuffer(stickerBuffer) || stickerBuffer.length === 0) {
+    throw new Error('Empty or invalid sticker buffer');
+  }
+  if (stickerBuffer.length > MAX_STICKER_CONVERT_BYTES) {
+    throw new Error('Sticker exceeds the 2 MB conversion size limit');
+  }
+  if (targetFormat !== 'img' && targetFormat !== 'vid' && targetFormat !== 'gif') {
+    throw new Error(`Unsupported target format: ${targetFormat}`);
+  }
+
+  const jobDir = path.join(TEMP_ROOT, `st2media_${crypto.randomUUID()}`);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const cleanup = () =>
+    fs.promises.rm(jobDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+
+  try {
+    const img = new webp.Image();
+    await img.load(stickerBuffer);
+
+    if (img.width > 2048 || img.height > 2048) {
+      throw new Error('Sticker dimensions exceed 2048x2048 safety cap');
+    }
+
+    if (targetFormat === 'img') {
+      const singleFrameWebp = path.join(jobDir, 'frame_000.webp');
+      if (img.hasAnim && img.anim?.frames?.length > 0) {
+        await img._demuxFrame(singleFrameWebp, img.anim.frames[0]);
+      } else {
+        await fs.promises.writeFile(singleFrameWebp, stickerBuffer);
+      }
+
+      const outputPng = path.join(jobDir, 'output.png');
+      await run('ffmpeg', [
+        '-y',
+        '-i', singleFrameWebp,
+        '-frames:v', '1',
+        '-vf', "scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
+        outputPng,
+      ]);
+
+      return {
+        filePath: outputPng,
+        mimetype: 'image/png',
+        isGifPlayback: false,
+        cleanup,
+      };
+    }
+
+    if (!img.hasAnim || !img.anim?.frames?.length) {
+      throw new Error('This is a static sticker. Use .cimg to convert it to an image.');
+    }
+
+    const rawFrames = img.anim.frames.slice(0, MAX_ANIMATED_FRAMES);
+    const extracted = [];
+    let cycleDuration = 0;
+
+    for (let i = 0; i < rawFrames.length; i++) {
+      if (cycleDuration >= MAX_OUTPUT_DURATION_SEC && extracted.length > 0) break;
+      const frame = rawFrames[i];
+      const delayMs = Math.min(1000, Math.max(20, Number(frame.delay) || 66));
+      const delaySec = Number((delayMs / 1000).toFixed(3));
+      const baseName = `frame_${String(i).padStart(3, '0')}`;
+      const webpFile = `${baseName}.webp`;
+      await img._demuxFrame(path.join(jobDir, webpFile), frame);
+      extracted.push({ baseName, webpFile, delaySec });
+      cycleDuration += delaySec;
+    }
+
+    if (extracted.length === 0) {
+      throw new Error('Failed to extract frames from animated sticker');
+    }
+
+    const loops =
+      cycleDuration > 0 && cycleDuration < 3
+        ? Math.min(3, Math.max(2, Math.ceil(3 / cycleDuration)))
+        : 1;
+
+    const buildConcatManifest = (ext) => {
+      const lines = ['ffconcat version 1.0'];
+      let totalDur = 0;
+      let lastFile = `${extracted[0].baseName}.${ext}`;
+      for (let l = 0; l < loops; l++) {
+        for (const item of extracted) {
+          if (totalDur >= MAX_OUTPUT_DURATION_SEC && lines.length > 1) break;
+          lastFile = `${item.baseName}.${ext}`;
+          lines.push(`file '${lastFile}'`);
+          lines.push(`duration ${item.delaySec}`);
+          totalDur += item.delaySec;
+        }
+      }
+      lines.push(`file '${lastFile}'`);
+      return `${lines.join('\n')}\n`;
+    };
+
+    const framesTxtPath = path.join(jobDir, 'frames.txt');
+    const outputMp4 = path.join(jobDir, 'output.mp4');
+    const encodeArgs = [
+      '-y',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', framesTxtPath,
+      '-t', String(MAX_OUTPUT_DURATION_SEC),
+      '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p',
+      '-r', '30',
+      '-c:v', 'libx264',
+      '-profile:v', 'high',
+      '-level:v', '4.1',
+      '-preset', 'fast',
+      '-crf', '20',
+      '-an',
+      '-movflags', '+faststart',
+      outputMp4,
+    ];
+
+    await fs.promises.writeFile(framesTxtPath, buildConcatManifest('webp'));
+    try {
+      await run('ffmpeg', encodeArgs);
+    } catch {
+      // Fallback: decode single-frame WebPs to PNG if mixed VP8/VP8L chunks fail in concat demuxer
+      for (const item of extracted) {
+        await run('ffmpeg', [
+          '-y',
+          '-i', path.join(jobDir, item.webpFile),
+          '-frames:v', '1',
+          path.join(jobDir, `${item.baseName}.png`),
+        ]);
+      }
+      await fs.promises.writeFile(framesTxtPath, buildConcatManifest('png'));
+      await run('ffmpeg', encodeArgs);
+    }
+
+    return {
+      filePath: outputMp4,
+      mimetype: 'video/mp4',
+      isGifPlayback: targetFormat === 'gif',
+      cleanup,
+    };
+  } catch (err) {
+    await cleanup();
+    throw err;
   }
 }
