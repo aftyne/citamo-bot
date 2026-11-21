@@ -14,6 +14,7 @@ import {
   ensureMp3Audio,
   ensureWhatsAppCodecs,
   extractTikTokPhotoCarousel,
+  getYtDlpCookieArgs,
   optimizeAndSplitForStatus,
   probeCodecs,
   probeMediaInfo,
@@ -546,7 +547,50 @@ console.log('\n=== Test 7: NSFW blocker, IP-grabber defense, raw-IP block & doma
   if (allowedCheck.hostname !== 'www.youtube.com') {
     fail('Test 7d expected youtube.com to pass assertSafePublicUrl');
   }
-  console.log('[Test 7] PASS (NSFW blocker, anti-IP-grabber, domain allowlist & metadata filter verified)');
+
+  // 7e: Optional cookie arg validation (missing file skipped safely, invalid browser flag rejected, valid file accepted)
+  const prevCookiesFile = process.env.YTDLP_COOKIES_FILE;
+  const prevCookiesBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER;
+  const cookieTmpDir = path.join(TEMP_ROOT, `cookie_test_${crypto.randomUUID()}`);
+  fs.mkdirSync(cookieTmpDir, { recursive: true });
+  try {
+    delete process.env.YTDLP_COOKIES_FILE;
+    delete process.env.YTDLP_COOKIES_FROM_BROWSER;
+    if (getYtDlpCookieArgs().length !== 0) {
+      fail('Test 7e expected empty cookie args when env vars unset');
+    }
+
+    process.env.YTDLP_COOKIES_FILE = path.join(cookieTmpDir, 'nonexistent.txt');
+    if (getYtDlpCookieArgs().length !== 0) {
+      fail('Test 7e expected missing YTDLP_COOKIES_FILE to be skipped safely');
+    }
+
+    const validCookiePath = path.join(cookieTmpDir, 'cookies.txt');
+    await fs.promises.writeFile(validCookiePath, '# Netscape HTTP Cookie File\n');
+    process.env.YTDLP_COOKIES_FILE = validCookiePath;
+    const fileArgs = getYtDlpCookieArgs();
+    if (fileArgs[0] !== '--cookies' || fileArgs[1] !== path.resolve(validCookiePath)) {
+      fail(`Test 7e expected [--cookies, resolvedPath], got ${JSON.stringify(fileArgs)}`);
+    }
+
+    delete process.env.YTDLP_COOKIES_FILE;
+    process.env.YTDLP_COOKIES_FROM_BROWSER = '--exec malicious';
+    if (getYtDlpCookieArgs().length !== 0) {
+      fail('Test 7e expected flag-injection YTDLP_COOKIES_FROM_BROWSER to be rejected');
+    }
+    process.env.YTDLP_COOKIES_FROM_BROWSER = 'chrome:Default';
+    const browserArgs = getYtDlpCookieArgs();
+    if (browserArgs[0] !== '--cookies-from-browser' || browserArgs[1] !== 'chrome:Default') {
+      fail(`Test 7e expected [--cookies-from-browser, chrome:Default], got ${JSON.stringify(browserArgs)}`);
+    }
+  } finally {
+    if (prevCookiesFile === undefined) delete process.env.YTDLP_COOKIES_FILE;
+    else process.env.YTDLP_COOKIES_FILE = prevCookiesFile;
+    if (prevCookiesBrowser === undefined) delete process.env.YTDLP_COOKIES_FROM_BROWSER;
+    else process.env.YTDLP_COOKIES_FROM_BROWSER = prevCookiesBrowser;
+    await fs.promises.rm(cookieTmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+  console.log('[Test 7] PASS (NSFW blocker, anti-IP-grabber, domain allowlist, metadata filter & cookie arg safety verified)');
 }
 
 // ---------------------------------------------------------------------------

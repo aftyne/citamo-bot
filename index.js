@@ -237,7 +237,7 @@ async function startSock() {
       // Self-message loop guard: ignore messages sent by the bot itself
       if (msg.key?.id && sentMessageIds.has(msg.key.id)) continue;
 
-      // Fix #1: Unwrap ephemeral / disappearing, viewOnce, and documentWithCaption wrappers
+      // Unwrap ephemeral / disappearing, viewOnce, and documentWithCaption wrappers
       const content = extractMessageContent(msg.message);
       if (!content) continue;
 
@@ -256,7 +256,7 @@ async function startSock() {
       const senderJid = msg.key.participant || remoteJid;
       const menuKey = `${remoteJid}_${senderJid}`;
 
-      // 1. Check if user is replying to an active .cdl menu (`1`, `2`, `mp4`, `mp3`, `img`)
+      // Check if user is replying to an active .cdl menu (`1`, `2`, `mp4`, `mp3`, `img`)
       const choice = trimmed.toLowerCase();
       if (
         pendingCdlMenus.has(menuKey) &&
@@ -273,7 +273,7 @@ async function startSock() {
         continue;
       }
 
-      // 2. Check for .chelp or .menu command (with 10s per-chat cooldown)
+      // Check for .chelp or .menu command (with 10s per-chat cooldown)
       if (choice === ".chelp" || choice === ".menu") {
         const now = Date.now();
         const lastHelpAt = helpCooldowns.get(remoteJid) || 0;

@@ -6,6 +6,15 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
+const envPath = path.join(process.cwd(), ".env");
+if (fs.existsSync(envPath)) {
+  try {
+    process.loadEnvFile?.(envPath);
+  } catch (err) {
+    console.warn("[downloader] Failed to load .env:", err.message);
+  }
+}
+
 export const TEMP_ROOT = path.join(process.cwd(), "temp");
 const TIMEOUT_MS = 180_000; // 180s hard limit per external process
 const PROBE_INFO_TIMEOUT_MS = 12_000; // 12s fast metadata probe timeout
@@ -170,6 +179,46 @@ export const ALLOWED_MEDIA_DOMAINS = [
   "discordapp.net",
 ];
 
+const AUTH_REQUIRED_MSG =
+  "This post requires login or is private/unavailable. Set YTDLP_COOKIES_FILE (or YTDLP_COOKIES_FROM_BROWSER) to access login-walled Instagram posts.";
+const COOKIES_BROWSER_REGEX = /^[a-z0-9_-]+(?::[a-z0-9_ .+-]+)?$/i;
+let warnedMissingCookies = false;
+
+export function getYtDlpCookieArgs() {
+  const cookiesFile = (process.env.YTDLP_COOKIES_FILE || "").trim();
+  if (cookiesFile) {
+    const resolvedPath = path.resolve(cookiesFile);
+    try {
+      if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
+        return ["--cookies", resolvedPath];
+      }
+    } catch {
+      // fall through to warning
+    }
+    if (!warnedMissingCookies) {
+      warnedMissingCookies = true;
+      console.warn(
+        `[downloader] YTDLP_COOKIES_FILE not found or not a file (${cookiesFile}); continuing without cookies.`,
+      );
+    }
+    return [];
+  }
+
+  const browser = (process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
+  if (browser) {
+    if (COOKIES_BROWSER_REGEX.test(browser) && !browser.startsWith("-")) {
+      return ["--cookies-from-browser", browser];
+    }
+    if (!warnedMissingCookies) {
+      warnedMissingCookies = true;
+      console.warn(
+        "[downloader] Ignoring invalid YTDLP_COOKIES_FROM_BROWSER value.",
+      );
+    }
+  }
+  return [];
+}
+
 function getYtDlpSecurityArgs(includeMatchFilter = true) {
   const args = ["--age-limit", "17"];
   if (includeMatchFilter) {
@@ -178,6 +227,7 @@ function getYtDlpSecurityArgs(includeMatchFilter = true) {
   if (process.env.YTDLP_PROXY) {
     args.push("--proxy", process.env.YTDLP_PROXY);
   }
+  args.push(...getYtDlpCookieArgs());
   return args;
 }
 
@@ -244,6 +294,15 @@ export function run(cmd, args, timeoutMs = TIMEOUT_MS) {
             )
           ) {
             return reject(new Error(NSFW_BLOCK_MSG));
+          }
+          if (
+            /Instagram sent an empty media response|login required|rate-limit reached|not available.*logged-in|requested content is not available/i.test(
+              stderr || "",
+            )
+          ) {
+            const authErr = new Error(AUTH_REQUIRED_MSG);
+            authErr.isAuthRequired = true;
+            return reject(authErr);
           }
           const safeDetail = sanitizeStderr(stderr);
           return reject(
@@ -566,7 +625,7 @@ export async function extractTikTokPhotoCarousel(url) {
       }
     }
   } catch (err) {
-    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+    if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
     }
   }
@@ -607,7 +666,7 @@ export async function extractTikTokPhotoCarousel(url) {
       }
     }
   } catch (err) {
-    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+    if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
     }
   }
@@ -1020,7 +1079,7 @@ export async function probeMediaInfo(url) {
         };
       }
     } catch (err) {
-      if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
         throw err;
       }
     }
@@ -1086,7 +1145,7 @@ export async function probeMediaInfo(url) {
       safeTitle: sanitizeFileName(rawTitle),
     };
   } catch (err) {
-    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+    if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
     }
     if (/tiktok\.com/i.test(resolved.canonicalUrl)) {
@@ -1349,7 +1408,7 @@ export async function downloadAudioMp3(url, preferredTitle = "") {
         resolved.canonicalUrl,
       ]);
     } catch (err) {
-      if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+      if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
         throw err;
       }
       if (
@@ -1544,7 +1603,7 @@ async function extractCarouselMetadata(url) {
       return { slideUrls, audioUrl, canonicalUrl: resolved.canonicalUrl };
     }
   } catch (err) {
-    if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+    if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
       throw err;
     }
   }
@@ -1813,7 +1872,7 @@ export async function downloadVideo(url) {
         const sizeInMB = fs.statSync(filePath).size / (1024 * 1024);
         return { filePath, sizeInMB, cleanup };
       } catch (err) {
-        if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+        if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
           throw err;
         }
         const rawCandidate = path.join(jobDir, "video.mp4");
@@ -1907,7 +1966,7 @@ export async function downloadAndOptimizeForStatus(url) {
         const parts = await optimizeAndSplitForStatus(rawFilePath, jobDir);
         return { parts, cleanup };
       } catch (err) {
-        if (err?.isContentBlock || /NSFW or age-restricted/i.test(err?.message)) {
+        if (err?.isContentBlock || err?.isAuthRequired || /NSFW or age-restricted/i.test(err?.message)) {
           throw err;
         }
         const rawCandidate = path.join(jobDir, "video.mp4");
